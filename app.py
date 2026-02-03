@@ -1,270 +1,263 @@
-# !pip install streamlit nba_api plotly pandas numpy
-
 import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from nba_api.stats.endpoints import leaguedashplayerstats, teamgamelog, leaguedashteamstats, shotchartdetail
+from nba_api.stats.endpoints import teamgamelog, leaguedashplayerstats
 from nba_api.stats.static import teams
 
 # ==========================================
-# 1. PAGE CONFIGURATION & STYLING
+# 1. CONFIGURATION & STYLE
 # ==========================================
-st.set_page_config(page_title="Nuggets vs Spurs Analytics", layout="wide", page_icon="🏀")
+st.set_page_config(
+    page_title="NBA Scouting Report Pro",
+    layout="wide",
+    page_icon="🏀",
+    initial_sidebar_state="expanded"
+)
 
-# Custom CSS to make it look like a pro dashboard
+# CSS Custom pour un look "Dark Analytics"
 st.markdown("""
     <style>
-    .main {
-        background-color: #f0f2f6;
-    }
-    h1 {
-        color: #1d428a; /* NBA Blue */
-    }
-    h2 {
-        color: #ce1141; /* NBA Red */
-    }
-    .stMetric {
-        background-color: white;
-        padding: 10px;
-        border-radius: 5px;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-    }
+    .stApp { background-color: #0e1117; color: white; }
+    div[data-testid="stMetricValue"] { font-size: 26px; font-weight: bold; }
+    .highlight { color: #FEC524; font-weight: bold; }
     </style>
-    """, unsafe_allow_html=True)
+""", unsafe_allow_html=True)
 
 
 # ==========================================
-# 2. DATA LOADING FUNCTIONS (Cached)
+# 2. DATA ENGINE
 # ==========================================
+
 @st.cache_data
-def load_data(season='2024-25'):
-    # Team IDs
-    nuggets_id = [x for x in teams.get_teams() if x['full_name'] == 'Denver Nuggets'][0]['id']
-    spurs_id = [x for x in teams.get_teams() if x['full_name'] == 'San Antonio Spurs'][0]['id']
-
-    # 1. Player Stats (General)
-    player_stats = leaguedashplayerstats.LeagueDashPlayerStats(season=season).get_data_frames()[0]
-
-    # 2. Team Stats (General)
-    team_stats = leaguedashteamstats.LeagueDashTeamStats(season=season).get_data_frames()[0]
-
-    # 3. Game Logs (Trends)
-    spurs_log = teamgamelog.TeamGameLog(team_id=spurs_id, season=season).get_data_frames()[0]
-
-    # 4. Shot Chart (Spurs)
-    # Note: 0 as player_id gets team shots
-    shots = shotchartdetail.ShotChartDetail(
-        team_id=spurs_id,
-        player_id=0,
-        context_measure_simple='FGA',
-        season_nullable=season
-    ).get_data_frames()[0]
-
-    return nuggets_id, spurs_id, player_stats, team_stats, spurs_log, shots
+def get_all_teams():
+    return teams.get_teams()
 
 
-# Load Data
-try:
-    with st.spinner('Loading NBA Data from API...'):
-        NUGGETS_ID, SPURS_ID, df_players, df_teams, df_trends, df_shots = load_data()
+@st.cache_data
+def load_team_data(team_id, season='2024-25'):
+    # Récupération des logs de matchs
+    log = teamgamelog.TeamGameLog(team_id=team_id, season=season).get_data_frames()[0]
 
-    spurs_roster = df_players[df_players['TEAM_ID'] == SPURS_ID]
-    nuggets_roster = df_players[df_players['TEAM_ID'] == NUGGETS_ID]
-    spurs_team_stats = df_teams[df_teams['TEAM_ID'] == SPURS_ID]
-    nuggets_team_stats = df_teams[df_teams['TEAM_ID'] == NUGGETS_ID]
+    # Conversion numérique
+    cols = ['PTS', 'FGM', 'FGA', 'FG3M', 'FG3A', 'FTA', 'OREB', 'DREB', 'REB', 'AST', 'STL', 'BLK', 'TOV']
+    for c in cols:
+        log[c] = pd.to_numeric(log[c])
 
-except Exception as e:
-    st.error(f"Error connecting to NBA API: {e}. Please refresh or check internet connection.")
-    st.stop()
+    log['GAME_DATE'] = pd.to_datetime(log['GAME_DATE'])
+
+    # CALCUL AVANCÉ : ESTIMATION DES POSSESSIONS
+    # Formule simple : FGA + 0.44*FTA - ORB + TOV
+    log['POSS'] = log['FGA'] + 0.44 * log['FTA'] - log['OREB'] + log['TOV']
+    log['ORTG'] = (log['PTS'] / log['POSS']) * 100
+
+    return log
+
+
+@st.cache_data
+def get_top_players(team_id, season='2024-25'):
+    # Cette API peut être lente, on la met en cache.
+    # Récupère les stats globales des joueurs pour l'équipe
+    try:
+        df = leaguedashplayerstats.LeagueDashPlayerStats(
+            team_id_nullable=team_id, season=season
+        ).get_data_frames()[0]
+        return df.sort_values('PTS', ascending=False).head(5)
+    except:
+        return pd.DataFrame()
+
+
+def calculate_aggregated_stats(df, games_count, location):
+    filtered_df = df.copy()
+
+    # Filtres
+    if location == 'Home':
+        filtered_df = filtered_df[filtered_df['MATCHUP'].str.contains(' vs. ')]
+    elif location == 'Away':
+        filtered_df = filtered_df[filtered_df['MATCHUP'].str.contains(' @ ')]
+
+    if games_count != 'All Season':
+        n = int(games_count.split()[1])
+        filtered_df = filtered_df.head(n)
+
+    if filtered_df.empty:
+        return None, filtered_df
+
+    # Moyennes pondérées
+    stats = {
+        'PTS': filtered_df['PTS'].mean(),
+        'POSS': filtered_df['POSS'].mean(),
+        'ORTG': filtered_df['ORTG'].mean(),
+        'AST': filtered_df['AST'].mean(),
+        'REB': filtered_df['REB'].mean(),
+        'TOV': filtered_df['TOV'].mean(),
+        'TS%': (filtered_df['PTS'].sum() / (2 * (filtered_df['FGA'].sum() + 0.44 * filtered_df['FTA'].sum()))) * 100,
+        '3P%': (filtered_df['FG3M'].sum() / filtered_df['FG3A'].sum()) * 100 if filtered_df['FG3A'].sum() > 0 else 0,
+        'Win_Rate': (filtered_df['WL'] == 'W').mean() * 100
+    }
+    return stats, filtered_df
 
 
 # ==========================================
-# 3. HELPER FUNCTIONS (Court Drawing)
+# 3. SIDEBAR CONTROLS
 # ==========================================
-def draw_court(fig, layer='below'):
-    # Standard NBA Court Dimensions overlay for Plotly
-    court_color = 'rgba(0,0,0,0.5)'
-    lw = 1.5
+st.sidebar.header("🏀 Matchup Selector")
 
-    # Hoop
-    fig.add_shape(type="circle", x0=-7.5, y0=-7.5, x1=7.5, y1=7.5, line_color="orange")
-    # Lane
-    fig.add_shape(type="rect", x0=-80, y0=-47.5, x1=80, y1=142.5, line_color=court_color, line_width=lw)
-    # 3-Point Line
-    fig.add_shape(type="path", path="M -220 92.5 C -220 300, 220 300, 220 92.5", line_color=court_color, line_width=lw)
-    fig.add_shape(type="line", x0=-220, y0=-47.5, x1=-220, y1=92.5, line_color=court_color, line_width=lw)
-    fig.add_shape(type="line", x0=220, y0=-47.5, x1=220, y1=92.5, line_color=court_color, line_width=lw)
+all_teams = get_all_teams()
+team_names = [t['full_name'] for t in all_teams]
+team_names.sort()
 
-    fig.update_layout(
-        xaxis=dict(showgrid=False, zeroline=False, showticklabels=False, range=[-250, 250]),
-        yaxis=dict(showgrid=False, zeroline=False, showticklabels=False, range=[400, -50]),  # Inverted Y for basketball
-        height=600, width=600,
-        plot_bgcolor='white'
-    )
-    return fig
+# Sélection Team A et Team B
+team_a_name = st.sidebar.selectbox("🏠 Home Team", team_names, index=team_names.index("San Antonio Spurs"))
+team_b_name = st.sidebar.selectbox("✈️ Away Team", team_names, index=team_names.index("Denver Nuggets"))
 
+# Récupération des IDs
+team_a_id = [t['id'] for t in all_teams if t['full_name'] == team_a_name][0]
+team_b_id = [t['id'] for t in all_teams if t['full_name'] == team_b_name][0]
 
-# ==========================================
-# 4. DASHBOARD LAYOUT
-# ==========================================
-
-# --- SIDEBAR ---
-st.sidebar.image("https://cdn.nba.com/logos/nba/1610612743/primary/L/logo.svg", width=100)
-st.sidebar.title("Scouting Report")
-st.sidebar.header("Denver Nuggets vs. San Antonio Spurs")
 st.sidebar.markdown("---")
-analysis_focus = st.sidebar.radio("Go to Section:",
-                                  ["1. Team Overview", "2. Key Players", "3. Star Matchup", "4. Shot Selection",
-                                   "5. Trends & Weaknesses"])
-st.sidebar.info("**Group:** Adam, Taha MI, Cyril, Yuxuan, Vincent")
+filter_games = st.sidebar.selectbox("📅 Timeframe:", ['All Season', 'Last 10 Games', 'Last 5 Games'])
+st.sidebar.caption("Note: Stats are fetched live from NBA API.")
 
-# --- HEADER ---
-st.title(f"📊 Game Prep: Nuggets vs Spurs")
-st.markdown("Data Intelligence for the Coaching Staff.")
+# ==========================================
+# 4. DASHBOARD LOGIC
+# ==========================================
 
-# --- SECTIONS ---
+# Loading Data
+with st.spinner('Scouting reports loading...'):
+    log_a = load_team_data(team_a_id)
+    log_b = load_team_data(team_b_id)
 
-if analysis_focus == "1. Team Overview":
-    st.header("Team Comparison")
+    # Pour l'équipe A (Home), on regarde ses stats à domicile si l'utilisateur veut être précis,
+    # mais pour simplifier la comparaison globale, on garde les filtres globaux pour l'instant
+    stats_a, df_a = calculate_aggregated_stats(log_a, filter_games, 'All')
+    stats_b, df_b = calculate_aggregated_stats(log_b, filter_games, 'All')
 
+    players_a = get_top_players(team_a_id)
+    players_b = get_top_players(team_b_id)
+
+# Header
+col_h1, col_h2, col_h3 = st.columns([1, 2, 1])
+with col_h1:
+    st.markdown(f"## {team_a_name}")
+    st.markdown(f"<h1 style='color:#4CAF50'>{stats_a['Win_Rate']:.1f}% Win</h1>", unsafe_allow_html=True)
+with col_h2:
+    st.markdown("<h3 style='text-align: center; vertical-align: middle; line-height: 100px;'>VS</h3>",
+                unsafe_allow_html=True)
+with col_h3:
+    st.markdown(f"## {team_b_name}")
+    st.markdown(f"<h1 style='color:#FF5722'>{stats_b['Win_Rate']:.1f}% Win</h1>", unsafe_allow_html=True)
+
+st.divider()
+
+# TABS LAYOUT
+tab1, tab2, tab3 = st.tabs(["📊 General Stats", "🧠 Advanced Metrics", "🌟 Top Players"])
+
+# --- TAB 1: GENERAL ---
+with tab1:
     col1, col2, col3, col4 = st.columns(4)
 
-    # Metrics
-    with col1:
-        st.metric("Spurs PTS/Game", spurs_team_stats['PTS'].values[0],
-                  delta=float(spurs_team_stats['PTS'].values[0]) - float(nuggets_team_stats['PTS'].values[0]))
-    with col2:
-        st.metric("Spurs Rebounds", spurs_team_stats['REB'].values[0],
-                  delta=float(spurs_team_stats['REB'].values[0]) - float(nuggets_team_stats['REB'].values[0]))
-    with col3:
-        st.metric("Spurs Turnovers", spurs_team_stats['TOV'].values[0],
-                  delta=-(float(spurs_team_stats['TOV'].values[0]) - float(nuggets_team_stats['TOV'].values[0])),
-                  delta_color="inverse")  # Less TOV is better
-    with col4:
-        st.metric("Spurs 3P%", f"{spurs_team_stats['FG3_PCT'].values[0] * 100:.1f}%")
 
-    st.subheader("Comparison Chart")
+    def delta_metric(col, label, key, better='high'):
+        val_a = stats_a[key]
+        val_b = stats_b[key]
+        diff = val_a - val_b
 
-    # Preparing data for comparison
-    comp_df = pd.concat([spurs_team_stats, nuggets_team_stats])
-    comp_df['Team'] = ['Spurs', 'Nuggets']
+        # Gestion des couleurs pour les deltas
+        color = "normal"
+        if better == 'low':
+            color = "inverse"
 
-    fig = go.Figure(data=[
-        go.Bar(name='Points', x=comp_df['Team'], y=comp_df['PTS']),
-        go.Bar(name='Rebounds', x=comp_df['Team'], y=comp_df['REB']),
-        go.Bar(name='Assists', x=comp_df['Team'], y=comp_df['AST'])
-    ])
-    fig.update_layout(barmode='group', title="Head-to-Head Averages")
-    st.plotly_chart(fig, use_container_width=True)
+        col.metric(label, f"{val_a:.1f}", f"{diff:.1f} vs {team_b_name}", delta_color=color)
 
-elif analysis_focus == "2. Key Players":
-    st.header("Identifying Opponent Threats")
 
-    stat_filter = st.selectbox("Sort Players By:", ['PTS', 'REB', 'AST', 'STL', 'BLK', 'TOV'])
+    with col1: delta_metric(st, "Points / Game", 'PTS')
+    with col2: delta_metric(st, "Rebounds", 'REB')
+    with col3: delta_metric(st, "Assists", 'AST')
+    with col4: delta_metric(st, "Turnovers", 'TOV', better='low')
 
-    top_players = spurs_roster.sort_values(by=stat_filter, ascending=False).head(5)
+    st.subheader("Scoring Trend (Last Games)")
 
-    fig = px.bar(top_players, x='PLAYER_NAME', y=stat_filter,
-                 color=stat_filter, title=f"Top 5 Spurs by {stat_filter}",
-                 color_continuous_scale='Viridis')
-    st.plotly_chart(fig, use_container_width=True)
+    # Graphique combiné
+    fig_trend = go.Figure()
+    fig_trend.add_trace(go.Scatter(x=df_a['GAME_DATE'], y=df_a['PTS'], mode='lines+markers', name=team_a_name))
+    fig_trend.add_trace(
+        go.Scatter(x=df_b['GAME_DATE'], y=df_b['PTS'], mode='lines+markers', name=team_b_name, line=dict(dash='dash')))
+    fig_trend.update_layout(height=350, margin=dict(l=20, r=20, t=20, b=20), hovermode="x unified")
+    st.plotly_chart(fig_trend, use_container_width=True)
 
-    st.write("### Full Roster Stats")
-    st.dataframe(
-        spurs_roster[['PLAYER_NAME', 'GP', 'MIN', 'PTS', 'REB', 'AST', 'STL', 'BLK', 'TOV']].sort_values(by='PTS',
-                                                                                                         ascending=False))
+# --- TAB 2: ADVANCED ---
+with tab2:
+    col_adv1, col_adv2 = st.columns(2)
 
-elif analysis_focus == "3. Star Matchup":
-    st.header("The Main Event: Jokic vs. Wembanyama")
+    with col_adv1:
+        st.markdown("### Efficiency & Pace")
+        # Radar Chart amélioré
+        categories = ['Offensive Rating', 'True Shooting %', '3-Point %', 'Ball Security (Inv TOV)']
 
-    # Fetching specific players
-    jokic = nuggets_roster[nuggets_roster['PLAYER_NAME'].str.contains("Jokic")]
-    wemby = spurs_roster[spurs_roster['PLAYER_NAME'].str.contains("Wembanyama")]
 
-    if not jokic.empty and not wemby.empty:
-        p1 = jokic.iloc[0]
-        p2 = wemby.iloc[0]
+        # Normalisation grossière pour le radar (0-1)
+        def norm(val, max_val): return min(val / max_val, 1.0)
 
-        col1, col2 = st.columns(2)
-        with col1:
-            st.subheader("🃏 Nikola Jokic")
-            st.write(f"**PTS:** {p1['PTS']} | **REB:** {p1['REB']} | **AST:** {p1['AST']}")
-        with col2:
-            st.subheader("👽 Victor Wembanyama")
-            st.write(f"**PTS:** {p2['PTS']} | **REB:** {p2['REB']} | **BLK:** {p2['BLK']}")
 
-        # Radar Chart
-        categories = ['PTS', 'REB', 'AST', 'STL', 'BLK']
+        r_a = [
+            norm(stats_a['ORTG'], 130),
+            norm(stats_a['TS%'], 65),
+            norm(stats_a['3P%'], 45),
+            norm(30 - stats_a['TOV'], 30)
+        ]
+        r_b = [
+            norm(stats_b['ORTG'], 130),
+            norm(stats_b['TS%'], 65),
+            norm(stats_b['3P%'], 45),
+            norm(30 - stats_b['TOV'], 30)
+        ]
 
-        fig = go.Figure()
-        fig.add_trace(go.Scatterpolar(
-            r=[p1[c] for c in categories],
-            theta=categories,
-            fill='toself',
-            name='Jokic'
-        ))
-        fig.add_trace(go.Scatterpolar(
-            r=[p2[c] for c in categories],
-            theta=categories,
-            fill='toself',
-            name='Wembanyama'
-        ))
-        fig.update_layout(polar=dict(radialaxis=dict(visible=True)), title="Versatility Comparison")
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.warning("Could not find data for Jokic or Wembanyama.")
+        fig_radar = go.Figure()
+        fig_radar.add_trace(go.Scatterpolar(r=r_a, theta=categories, fill='toself', name=team_a_name))
+        fig_radar.add_trace(go.Scatterpolar(r=r_b, theta=categories, fill='toself', name=team_b_name))
+        fig_radar.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 1])), height=400)
+        st.plotly_chart(fig_radar, use_container_width=True)
 
-elif analysis_focus == "4. Shot Selection":
-    st.header("Spurs Shot Chart Analysis")
-    st.markdown("Where do they shoot from? Where are they dangerous?")
+    with col_adv2:
+        st.markdown("### The Pace Factor")
+        st.info("Pace estimates the number of possessions per 48 minutes. A higher pace means a faster game.")
 
-    col1, col2 = st.columns([3, 1])
+        fig_bar = go.Figure(data=[
+            go.Bar(name=team_a_name, x=['Pace (Possessions)'], y=[stats_a['POSS']], text=[f"{stats_a['POSS']:.1f}"],
+                   textposition='auto'),
+            go.Bar(name=team_b_name, x=['Pace (Possessions)'], y=[stats_b['POSS']], text=[f"{stats_b['POSS']:.1f}"],
+                   textposition='auto')
+        ])
+        fig_bar.update_layout(barmode='group', height=400)
+        st.plotly_chart(fig_bar, use_container_width=True)
 
-    with col2:
-        shot_type = st.radio("Filter Shot Outcome:", ["All", "Made Shot", "Missed Shot"])
+# --- TAB 3: PLAYERS ---
+with tab3:
+    st.subheader(f"🌟 Top Performers ({season})")
 
-    with col1:
-        filtered_shots = df_shots.copy()
-        if shot_type != "All":
-            filtered_shots = filtered_shots[filtered_shots['EVENT_TYPE'] == shot_type]
+    c1, c2 = st.columns(2)
 
-        fig = px.scatter(filtered_shots, x='LOC_X', y='LOC_Y', color='EVENT_TYPE',
-                         color_discrete_map={'Made Shot': '#00AA00', 'Missed Shot': '#FF0000'},
-                         opacity=0.5, hover_data=['PLAYER_NAME', 'SHOT_DISTANCE'])
+    with c1:
+        st.markdown(f"**{team_a_name} Leaders**")
+        if not players_a.empty:
+            st.dataframe(
+                players_a[['PLAYER_NAME', 'GP', 'PTS', 'AST', 'REB', 'FG_PCT']].style.background_gradient(cmap='Greens',
+                                                                                                          subset=[
+                                                                                                              'PTS']),
+                use_container_width=True, hide_index=True
+            )
+        else:
+            st.warning("Player data unavailable.")
 
-        fig = draw_court(fig)
-        st.plotly_chart(fig, use_container_width=True)
-
-    st.info("**Coach's Note:** Look for the density of shots. Are they attacking the rim or settling for mid-range?")
-
-elif analysis_focus == "5. Trends & Weaknesses":
-    st.header("Recent Trends & Turnovers")
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.subheader("Last 5 Games: Points Scored")
-        # Ensure dates are datetime
-        df_trends['GAME_DATE'] = pd.to_datetime(df_trends['GAME_DATE'])
-        fig_trend = px.line(df_trends.head(10), x='GAME_DATE', y='PTS', markers=True,
-                            title="Scoring Trend (Last 10 Games)")
-        st.plotly_chart(fig_trend, use_container_width=True)
-
-    with col2:
-        st.subheader("Turnover Vulnerability")
-        avg_tov = spurs_team_stats['TOV'].values[0]
-
-        fig_gauge = go.Figure(go.Indicator(
-            mode="gauge+number",
-            value=avg_tov,
-            domain={'x': [0, 1], 'y': [0, 1]},
-            title={'text': "Avg Turnovers per Game"},
-            gauge={
-                'axis': {'range': [None, 20]},
-                'bar': {'color': "red" if avg_tov > 14 else "green"},
-                'threshold': {'line': {'color': "black", 'width': 4}, 'thickness': 0.75, 'value': 14}
-            }
-        ))
-        st.plotly_chart(fig_gauge, use_container_width=True)
-        st.caption("Target: Force more than 14 turnovers.")
+    with c2:
+        st.markdown(f"**{team_b_name} Leaders**")
+        if not players_b.empty:
+            st.dataframe(
+                players_b[['PLAYER_NAME', 'GP', 'PTS', 'AST', 'REB', 'FG_PCT']].style.background_gradient(cmap='Blues',
+                                                                                                          subset=[
+                                                                                                              'PTS']),
+                use_container_width=True, hide_index=True
+            )
+        else:
+            st.warning("Player data unavailable.")
