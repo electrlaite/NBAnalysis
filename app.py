@@ -15,6 +15,9 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+season = '2025-26'
+
+
 # CSS Custom pour un look "Dark Analytics"
 st.markdown("""
     <style>
@@ -67,23 +70,31 @@ def get_top_players(team_id, season='2024-25'):
         return pd.DataFrame()
 
 
-def calculate_aggregated_stats(df, games_count, location):
+def calculate_aggregated_stats(df, games_count_label, location):
     filtered_df = df.copy()
 
-    # Filtres
+    # Filtre Location (Home/Away)
     if location == 'Home':
         filtered_df = filtered_df[filtered_df['MATCHUP'].str.contains(' vs. ')]
     elif location == 'Away':
         filtered_df = filtered_df[filtered_df['MATCHUP'].str.contains(' @ ')]
 
-    if games_count != 'All Season':
-        n = int(games_count.split()[1])
-        filtered_df = filtered_df.head(n)
+    # Filtre "Last N Games"
+    # On regarde si l'option choisie contient "Last"
+    if "Last" in games_count_label:
+        # On extrait le nombre (ex: "Last 10 Games" -> 10)
+        try:
+            n = int([s for s in games_count_label.split() if s.isdigit()][0])
+            filtered_df = filtered_df.head(n)
+        except:
+            pass # Si erreur, on garde tout
 
     if filtered_df.empty:
-        return None, filtered_df
+        # On retourne des zéros pour éviter les plantages si pas de matchs
+        empty_stats = {k: 0 for k in ['PTS', 'POSS', 'ORTG', 'AST', 'REB', 'TOV', 'TS%', '3P%', 'Win_Rate']}
+        return empty_stats, filtered_df
 
-    # Moyennes pondérées
+    # ... (Le reste du calcul des moyennes ne change pas) ...
     stats = {
         'PTS': filtered_df['PTS'].mean(),
         'POSS': filtered_df['POSS'].mean(),
@@ -92,7 +103,7 @@ def calculate_aggregated_stats(df, games_count, location):
         'REB': filtered_df['REB'].mean(),
         'TOV': filtered_df['TOV'].mean(),
         'TS%': (filtered_df['PTS'].sum() / (2 * (filtered_df['FGA'].sum() + 0.44 * filtered_df['FTA'].sum()))) * 100,
-        '3P%': (filtered_df['FG3M'].sum() / filtered_df['FG3A'].sum()) * 100 if filtered_df['FG3A'].sum() > 0 else 0,
+        '3P%': (filtered_df['FG3M'].sum() / (filtered_df['FG3A'].sum() + 0.001)) * 100, # +0.001 pour éviter div/0
         'Win_Rate': (filtered_df['WL'] == 'W').mean() * 100
     }
     return stats, filtered_df
@@ -103,38 +114,50 @@ def calculate_aggregated_stats(df, games_count, location):
 # ==========================================
 st.sidebar.header("🏀 Matchup Selector")
 
+# 1. Récupération des équipes
 all_teams = get_all_teams()
 team_names = [t['full_name'] for t in all_teams]
 team_names.sort()
 
-# Sélection Team A et Team B
+# Sélecteurs d'Équipes
 team_a_name = st.sidebar.selectbox("🏠 Home Team", team_names, index=team_names.index("San Antonio Spurs"))
 team_b_name = st.sidebar.selectbox("✈️ Away Team", team_names, index=team_names.index("Denver Nuggets"))
 
-# Récupération des IDs
 team_a_id = [t['id'] for t in all_teams if t['full_name'] == team_a_name][0]
 team_b_id = [t['id'] for t in all_teams if t['full_name'] == team_b_name][0]
 
 st.sidebar.markdown("---")
-filter_games = st.sidebar.selectbox("📅 Timeframe:", ['All Season', 'Last 10 Games', 'Last 5 Games'])
-st.sidebar.caption("Note: Stats are fetched live from NBA API.")
+st.sidebar.subheader("📅 Filters")
+
+# 2. DROPDOWN 1 : SAISONS (Dynamique)
+# On définit les 5 dernières saisons
+seasons_list = ['2024-25', '2023-24', '2022-23', '2021-22', '2020-21']
+selected_season = st.sidebar.selectbox("Select Season:", seasons_list, index=0)
+
+# 3. DROPDOWN 2 : GAME COUNT (Dynamique)
+# Choix du nombre de matchs à analyser dans la saison choisie
+game_count_option = st.sidebar.selectbox("Game Span:", ['All Season', 'Last 10 Games', 'Last 5 Games'])
+
+st.sidebar.info(f"Analyzing {game_count_option} from {selected_season}")
+
 
 # ==========================================
-# 4. DASHBOARD LOGIC
+# 4. DASHBOARD LOGIC (MIS À JOUR)
 # ==========================================
 
 # Loading Data
-with st.spinner('Scouting reports loading...'):
-    log_a = load_team_data(team_a_id)
-    log_b = load_team_data(team_b_id)
+with st.spinner(f'Fetching data for {selected_season}...'):
+    # NOTE: On passe 'selected_season' ici pour charger la bonne année
+    log_a = load_team_data(team_a_id, season=selected_season)
+    log_b = load_team_data(team_b_id, season=selected_season)
 
-    # Pour l'équipe A (Home), on regarde ses stats à domicile si l'utilisateur veut être précis,
-    # mais pour simplifier la comparaison globale, on garde les filtres globaux pour l'instant
-    stats_a, df_a = calculate_aggregated_stats(log_a, filter_games, 'All')
-    stats_b, df_b = calculate_aggregated_stats(log_b, filter_games, 'All')
+    # NOTE: On passe 'game_count_option' ici pour filtrer (All, 10, 5)
+    stats_a, df_a = calculate_aggregated_stats(log_a, game_count_option, 'All')
+    stats_b, df_b = calculate_aggregated_stats(log_b, game_count_option, 'All')
 
-    players_a = get_top_players(team_a_id)
-    players_b = get_top_players(team_b_id)
+    # NOTE: On passe aussi la saison aux joueurs
+    players_a = get_top_players(team_a_id, season=selected_season)
+    players_b = get_top_players(team_b_id, season=selected_season)
 
 # Header
 col_h1, col_h2, col_h3 = st.columns([1, 2, 1])
@@ -234,7 +257,12 @@ with tab2:
 
 # --- TAB 3: PLAYERS ---
 with tab3:
-    st.subheader(f"🌟 Top Performers ({season})")
+    # La variable 'season' est maintenant reconnue ici
+    st.subheader(f"🌟 Top Performers ({selected_season})")  # Utilise selected_season
+
+    # On s'assure aussi de passer la variable aux fonctions pour être cohérent
+    players_a = get_top_players(team_a_id, season=season)
+    players_b = get_top_players(team_b_id, season=season)
 
     c1, c2 = st.columns(2)
 
