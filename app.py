@@ -409,7 +409,7 @@ def plotly_shot_chart(shots_df, title_text, color_made='#44ff44'):
 # 4. SIDEBAR
 # ================================================================
 
-st.sidebar.markdown("## 🏀 NBA Scouting Pro")
+st.sidebar.markdown("## 🏀 *NBA*nalysis")
 st.sidebar.markdown("---")
 page = st.sidebar.radio("Navigate", [
     "📊 Overview", "🧠 Advanced Metrics", "🌟 Top Players & Shooters",
