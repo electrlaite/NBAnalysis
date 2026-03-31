@@ -14,7 +14,7 @@ import time
 # ================================================================
 # 1. PAGE CONFIG & STYLING
 # ================================================================
-st.set_page_config(page_title="NBA Scouting Report Pro", layout="wide",
+st.set_page_config(page_title="NBAnalysis", layout="wide",
                    page_icon="🏀", initial_sidebar_state="expanded")
 
 C_A = "#4CAF50"; C_B = "#2196F3"; ACCENT = "#FEC524"
