@@ -88,12 +88,19 @@ def load_team_log(team_id, season):
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def get_players(team_id, season):
+def get_players(team_id, season, last_n_games=0, location=''):
+    """last_n_games=0 means full season. location='' | 'Home' | 'Road' | 'All'."""
     time.sleep(0.6)
-    try:
-        df = leaguedashplayerstats.LeagueDashPlayerStats(
-            team_id_nullable=team_id, season=season
-        ).get_data_frames()[0]
+    def _build_kwargs(ln, loc):
+        kwargs = {'team_id_nullable': team_id, 'season': season}
+        if ln and ln > 0:
+            kwargs['last_n_games_nullable'] = ln
+        loc_api = {'Home': 'Home', 'Away': 'Road'}.get(loc)
+        if loc_api:
+            kwargs['location_nullable'] = loc_api
+        return kwargs
+
+    def _post_process(df):
         df['2PM'] = df['FGM'] - df['FG3M']
         df['2PA'] = df['FGA'] - df['FG3A']
         df['2P%'] = (df['2PM'] / df['2PA'].replace(0,1)*100).round(1)
@@ -103,12 +110,33 @@ def get_players(team_id, season):
         df['FTr'] = (df['FTA'] / df['FGA'].replace(0,1)).round(3)
         df['TS%'] = (df['PTS'] / (2*(df['FGA']+0.44*df['FTA']).replace(0,1))*100).round(1)
         return df.sort_values('PTS', ascending=False)
-    except Exception:
-        return pd.DataFrame()
+
+    # Try with filters first
+    try:
+        kwargs = _build_kwargs(last_n_games, location)
+        df = leaguedashplayerstats.LeagueDashPlayerStats(**kwargs).get_data_frames()[0]
+        if not df.empty:
+            return _post_process(df)
+    except Exception as e:
+        print(f"[get_players] Filtered call failed: {e}")
+
+    # Fallback: full season without filters
+    if last_n_games > 0 or location not in ('', 'All'):
+        try:
+            time.sleep(0.8)
+            df = leaguedashplayerstats.LeagueDashPlayerStats(
+                team_id_nullable=team_id, season=season
+            ).get_data_frames()[0]
+            if not df.empty:
+                return _post_process(df)
+        except Exception as e:
+            print(f"[get_players] Fallback call failed: {e}")
+
+    return pd.DataFrame()
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def get_shot_chart(team_id, season, player_id=0, game_id=''):
+def get_shot_chart(team_id, season, player_id=0, game_id='', date_from='', date_to=''):
     time.sleep(0.6)
     try:
         return shotchartdetail.ShotChartDetail(
@@ -116,6 +144,8 @@ def get_shot_chart(team_id, season, player_id=0, game_id=''):
             season_nullable=season, context_measure_simple='FGA',
             season_type_all_star='Regular Season',
             game_id_nullable=game_id,
+            date_from_nullable=date_from,
+            date_to_nullable=date_to,
         ).get_data_frames()[0]
     except Exception:
         return pd.DataFrame()
@@ -215,6 +245,24 @@ def filter_games(df, span, loc='All'):
             f = f.head(n)
         except (IndexError, ValueError): pass
     return f
+
+
+def span_to_last_n(span):
+    """Convert 'Last N Games' string to an integer N (0 = full season)."""
+    if "Last" in span:
+        try:
+            return int([s for s in span.split() if s.isdigit()][0])
+        except (IndexError, ValueError):
+            pass
+    return 0
+
+
+def df_date_range(df):
+    """Return (date_from, date_to) strings in MM/DD/YYYY format from a filtered game log."""
+    if df.empty or 'GAME_DATE' not in df.columns:
+        return '', ''
+    fmt = '%m/%d/%Y'
+    return df['GAME_DATE'].min().strftime(fmt), df['GAME_DATE'].max().strftime(fmt)
 
 
 def agg(df):
@@ -374,9 +422,9 @@ all_teams = get_all_teams()
 tnames = sorted([t['full_name'] for t in all_teams])
 
 team_a_name = st.sidebar.selectbox("🏠 Home Team", tnames,
-    index=tnames.index("San Antonio Spurs") if "San Antonio Spurs" in tnames else 0)
+    index=tnames.index("Denver Nuggets") if "Denver Nuggets" in tnames else 0)
 team_b_name = st.sidebar.selectbox("✈️ Away Team", tnames,
-    index=tnames.index("Denver Nuggets") if "Denver Nuggets" in tnames else 1)
+    index=tnames.index("San Antonio Spurs") if "San Antonio Spurs" in tnames else 1)
 
 team_a_id   = next(t['id'] for t in all_teams if t['full_name']==team_a_name)
 team_b_id   = next(t['id'] for t in all_teams if t['full_name']==team_b_name)
@@ -606,11 +654,12 @@ def pg_advanced():
 
 def pg_players():
     header()
-    filter_badge(applies_span=False, applies_loc=False)
-    st.caption("Player stats are full-season aggregates — Game Span and Location filters do not apply.")
+    filter_badge()
 
+    last_n = span_to_last_n(game_span)
     with st.spinner("Loading player stats…"):
-        pa=get_players(team_a_id,sel_season); pb=get_players(team_b_id,sel_season)
+        pa=get_players(team_a_id, sel_season, last_n_games=last_n, location=loc_filter)
+        pb=get_players(team_b_id, sel_season, last_n_games=last_n, location=loc_filter)
 
     st.markdown("### 🏆 Top Scorers")
     c1,c2=st.columns(2)
@@ -709,12 +758,16 @@ def pg_players():
 
 def pg_shots():
     header()
-    filter_badge(applies_span=False, applies_loc=False)
-    st.caption("Shot chart data covers the full season — Game Span and Location filters do not apply.")
+    filter_badge()
     st.subheader(f"Shot Chart — {sel_season}")
 
+    # Derive date window from the already-filtered game logs
+    dfa_from, dfa_to = df_date_range(df_a)
+    dfb_from, dfb_to = df_date_range(df_b)
+
     with st.spinner("Loading shot data…"):
-        shots_a=get_shot_chart(team_a_id,sel_season); shots_b=get_shot_chart(team_b_id,sel_season)
+        shots_a=get_shot_chart(team_a_id, sel_season, date_from=dfa_from, date_to=dfa_to)
+        shots_b=get_shot_chart(team_b_id, sel_season, date_from=dfb_from, date_to=dfb_to)
 
     c1,c2=st.columns(2)
     with c1: st.plotly_chart(plotly_shot_chart(shots_a,team_a_name,color_made='#66bb6a'),use_container_width=True)
@@ -738,7 +791,8 @@ def pg_shots():
 
     st.markdown("### 🎯 Preferred Shooting Positions by Player")
     with st.spinner("Loading player stats…"):
-        pa=get_players(team_a_id,sel_season); pb=get_players(team_b_id,sel_season)
+        pa=get_players(team_a_id, sel_season, last_n_games=span_to_last_n(game_span), location=loc_filter)
+        pb=get_players(team_b_id, sel_season, last_n_games=span_to_last_n(game_span), location=loc_filter)
     c1,c2=st.columns(2)
     for col,shots,players,name in [(c1,shots_a,pa,team_a_name),(c2,shots_b,pb,team_b_name)]:
         with col:
@@ -861,23 +915,108 @@ def pg_h2h():
         szn['SL']=szn['Season'].apply(lambda y:f"{y}-{str(y+1)[-2:]}")
         bs=szn.groupby('SL').agg(G=('WL','count'),W=('WL',lambda x:(x=='W').sum())).reset_index()
         bs['L']=bs['G']-bs['W']; bs=bs.sort_values('SL').tail(15)
-        fig=go.Figure()
-        fig.add_trace(go.Bar(x=bs['SL'],y=bs['W'],name='Wins',marker_color=C_A))
-        fig.add_trace(go.Bar(x=bs['SL'],y=bs['L'],name='Losses',marker_color='#ff5252'))
-        fig.update_layout(**PLT,height=350,barmode='stack')
-        st.plotly_chart(fig,use_container_width=True)
+        # Donut chart per season
+        n_seasons = len(bs)
+        if n_seasons <= 6:
+            n_cols = n_seasons
+        else:
+            n_cols = min(5, n_seasons)
+        rows_needed = (n_seasons + n_cols - 1) // n_cols
+        specs = [[{"type": "pie"}] * n_cols for _ in range(rows_needed)]
+        titles = bs['SL'].tolist()
+        # Pad with empty if needed
+        while len(titles) < rows_needed * n_cols:
+            titles.append('')
+        fig = make_subplots(rows=rows_needed, cols=n_cols, specs=specs, subplot_titles=titles)
+        for idx, (_, row) in enumerate(bs.iterrows()):
+            r_i = idx // n_cols + 1
+            c_i = idx % n_cols + 1
+            fig.add_trace(go.Pie(
+                labels=[f'{team_a_abbr} W', f'{team_a_abbr} L'],
+                values=[row['W'], row['L']],
+                marker_colors=[C_A, '#ff5252'],
+                hole=.45, textinfo='value',
+                showlegend=(idx == 0),
+            ), r_i, c_i)
+        fig.update_layout(**PLT, height=220 * rows_needed,
+            title=dict(text=f'{team_a_abbr} vs {team_b_abbr} — Season-by-Season', font_size=14))
+        st.plotly_chart(fig, use_container_width=True)
 
-    st.markdown("### Point Differential in Matchups")
-    r=h2h.head(30).sort_values('GAME_DATE')
-    if not r.empty and 'PLUS_MINUS' in r.columns:
-        cs=[C_A if v>=0 else '#ff5252' for v in r['PLUS_MINUS']]
-        fig=go.Figure(go.Bar(x=r['GAME_DATE'],y=r['PLUS_MINUS'],marker_color=cs))
-        fig.update_layout(**PLT,height=300,title=dict(text=f'{team_a_abbr} +/- (last 30)',font_size=13))
-        st.plotly_chart(fig,use_container_width=True)
+    #st.markdown("### Point Differential in Matchups")
+    # Fetch Team B's side of the matchup to compute reliable point differential
+    h2h_b = pd.DataFrame()
+    with st.spinner("Computing point differentials…"):
+        for attempt in range(2):
+            time.sleep(0.7)
+            h2h_b = get_head_to_head(team_b_id, team_a_id)
+            if not h2h_b.empty:
+                break
+
+    r = h2h.head(30).copy().sort_values('GAME_DATE')
+
+    # Strategy 1: Merge both sides using GAME_ID to compute PTS_A - PTS_B
+    point_diff_ok = False
+    if not h2h_b.empty and 'GAME_ID' in r.columns and 'GAME_ID' in h2h_b.columns:
+        # Normalize GAME_ID to string to avoid type mismatches
+        r['_GID'] = r['GAME_ID'].astype(str).str.strip()
+        h2h_b_copy = h2h_b[['GAME_ID', 'PTS']].copy()
+        h2h_b_copy['_GID'] = h2h_b_copy['GAME_ID'].astype(str).str.strip()
+        h2h_b_copy = h2h_b_copy.rename(columns={'PTS': 'PTS_OPP'}).drop(columns=['GAME_ID'])
+        h2h_b_copy['PTS_OPP'] = pd.to_numeric(h2h_b_copy['PTS_OPP'], errors='coerce')
+        merged = r.merge(h2h_b_copy, on='_GID', how='left')
+        merged['PTS'] = pd.to_numeric(merged['PTS'], errors='coerce')
+        merged['POINT_DIFF'] = merged['PTS'] - merged['PTS_OPP']
+        valid = merged.dropna(subset=['POINT_DIFF'])
+        if not valid.empty:
+            point_diff_ok = True
+            cs = [C_A if v >= 0 else '#ff5252' for v in valid['POINT_DIFF']]
+            fig = go.Figure(go.Bar(
+                x=valid['GAME_DATE'], y=valid['POINT_DIFF'],
+                marker_color=cs,
+                text=[f"{v:+.0f}" for v in valid['POINT_DIFF']],
+                textposition='outside',
+            ))
+            fig.update_layout(**PLT, height=320,
+                title=dict(text=f'{team_a_abbr} point differential vs {team_b_abbr} (last 30 matchups)', font_size=13),
+                yaxis=dict(zeroline=True, zerolinecolor='#555', zerolinewidth=1))
+            #st.plotly_chart(fig, use_container_width=True)
+
+    # Strategy 2: Use PLUS_MINUS column directly
+    if not point_diff_ok and 'PLUS_MINUS' in r.columns:
+        r['PLUS_MINUS'] = pd.to_numeric(r['PLUS_MINUS'], errors='coerce')
+        valid = r.dropna(subset=['PLUS_MINUS'])
+        # Also filter out rows where PLUS_MINUS is exactly 0 for all (might be dummy data)
+        if not valid.empty and not (valid['PLUS_MINUS'] == 0).all():
+            cs = [C_A if v >= 0 else '#ff5252' for v in valid['PLUS_MINUS']]
+            fig = go.Figure(go.Bar(
+                x=valid['GAME_DATE'], y=valid['PLUS_MINUS'],
+                marker_color=cs,
+                text=[f"{v:+.0f}" for v in valid['PLUS_MINUS']],
+                textposition='outside',
+            ))
+            fig.update_layout(**PLT, height=320,
+                title=dict(text=f'{team_a_abbr} point differential vs {team_b_abbr} (last 30 matchups)', font_size=13),
+                yaxis=dict(zeroline=True, zerolinecolor='#555', zerolinewidth=1))
+            st.plotly_chart(fig, use_container_width=True)
+            point_diff_ok = True
+
+    if not point_diff_ok:
+        st.info("Point differential data is not available for this matchup.")
 
     st.markdown("### Recent Match Results")
     d=h2h.head(20).copy()
-    sc=['GAME_DATE','MATCHUP','WL','PTS','REB','AST','FGM','FGA','FG3M','FG3A','FTM','FTA','PLUS_MINUS']
+    # Enrich with computed POINT_DIFF if h2h_b available
+    if not h2h_b.empty and 'GAME_ID' in d.columns and 'GAME_ID' in h2h_b.columns:
+        d['_GID'] = d['GAME_ID'].astype(str).str.strip()
+        d_b = h2h_b[['GAME_ID', 'PTS']].copy()
+        d_b['_GID'] = d_b['GAME_ID'].astype(str).str.strip()
+        d_b = d_b.rename(columns={'PTS': 'OPP_PTS'}).drop(columns=['GAME_ID'])
+        d_b['OPP_PTS'] = pd.to_numeric(d_b['OPP_PTS'], errors='coerce')
+        d = d.merge(d_b, on='_GID', how='left')
+        d['PTS'] = pd.to_numeric(d['PTS'], errors='coerce')
+        d['DIFF'] = d['PTS'] - d['OPP_PTS']
+        d = d.drop(columns=['_GID'], errors='ignore')
+    sc=['GAME_DATE','MATCHUP','WL','PTS','OPP_PTS','DIFF','REB','AST','FGM','FGA','FG3M','FG3A','FTM','FTA']
     sc=[c for c in sc if c in d.columns]; d['GAME_DATE']=d['GAME_DATE'].dt.strftime('%Y-%m-%d')
     st.dataframe(d[sc],use_container_width=True,hide_index=True)
 
@@ -888,13 +1027,14 @@ def pg_h2h():
 
 def pg_player_compare():
     header()
-    filter_badge(applies_span=False, applies_loc=False)
-    st.caption("Player stats and shot charts are full-season — Game Span and Location filters do not apply.")
+    filter_badge()
+    st.caption("Player stats and shot charts respect all filters (Season, Game Span, Location).")
     st.subheader("👤 Player-vs-Player Comparison")
 
+    last_n = span_to_last_n(game_span)
     with st.spinner("Loading rosters…"):
-        pa = get_players(team_a_id, sel_season)
-        pb = get_players(team_b_id, sel_season)
+        pa = get_players(team_a_id, sel_season, last_n_games=last_n, location=loc_filter)
+        pb = get_players(team_b_id, sel_season, last_n_games=last_n, location=loc_filter)
     if pa.empty or pb.empty:
         st.warning("Player data unavailable."); return
 
@@ -946,8 +1086,10 @@ def pg_player_compare():
 
     st.markdown("### Shot Placement")
     with st.spinner("Loading individual shot charts…"):
-        shots_pa = get_shot_chart(team_a_id, sel_season, player_id=pid_a)
-        shots_pb = get_shot_chart(team_b_id, sel_season, player_id=pid_b)
+        dfa_from, dfa_to = df_date_range(df_a)
+        dfb_from, dfb_to = df_date_range(df_b)
+        shots_pa = get_shot_chart(team_a_id, sel_season, player_id=pid_a, date_from=dfa_from, date_to=dfa_to)
+        shots_pb = get_shot_chart(team_b_id, sel_season, player_id=pid_b, date_from=dfb_from, date_to=dfb_to)
     c1, c2 = st.columns(2)
     with c1: st.plotly_chart(plotly_shot_chart(shots_pa,sel_a,color_made='#66bb6a'),use_container_width=True)
     with c2: st.plotly_chart(plotly_shot_chart(shots_pb,sel_b,color_made='#42a5f5'),use_container_width=True)
@@ -1076,14 +1218,32 @@ def pg_single_game():
         show=[c for c in show if c in dbs.columns]
         if show: st.dataframe(dbs[show],use_container_width=True,hide_index=True,height=500)
 
-    # Shot chart for game
+    # Shot chart for game — detect BOTH actual teams from the game data
     st.markdown("### 🎯 Shot Chart for This Game")
+
+    # Identify the two teams that actually played in this game
+    game_team_ids = []
+    game_team_names = []
+    if not line_score.empty and 'TEAM_ABBREVIATION' in line_score.columns:
+        id_col_ls = 'TEAM_ID' if 'TEAM_ID' in line_score.columns else 'teamId'
+        for i in range(min(2, len(line_score))):
+            row_ls = line_score.iloc[i]
+            tid = int(pd.to_numeric(row_ls.get(id_col_ls, 0), errors='coerce')) if id_col_ls in row_ls.index else 0
+            tname = row_ls.get('TEAM_ABBREVIATION', f'Team {i+1}')
+            game_team_ids.append(tid)
+            game_team_names.append(tname)
+
+    # Fallback: parse MATCHUP string from the selected game
+    if len(game_team_ids) < 2:
+        game_team_ids = [team_a_id, team_b_id]
+        game_team_names = [team_a_name, team_b_name]
+
     with st.spinner("Loading game shot chart…"):
-        gs_a=get_shot_chart(team_a_id,sel_season,game_id=game_id)
-        gs_b=get_shot_chart(team_b_id,sel_season,game_id=game_id)
-    c1,c2=st.columns(2)
-    with c1: st.plotly_chart(plotly_shot_chart(gs_a,team_a_name,color_made='#66bb6a'),use_container_width=True)
-    with c2: st.plotly_chart(plotly_shot_chart(gs_b,team_b_name,color_made='#42a5f5'),use_container_width=True)
+        gs_1 = get_shot_chart(game_team_ids[0], sel_season, game_id=game_id) if game_team_ids[0] else pd.DataFrame()
+        gs_2 = get_shot_chart(game_team_ids[1], sel_season, game_id=game_id) if len(game_team_ids) > 1 and game_team_ids[1] else pd.DataFrame()
+    c1, c2 = st.columns(2)
+    with c1: st.plotly_chart(plotly_shot_chart(gs_1, game_team_names[0], color_made='#66bb6a'), use_container_width=True)
+    with c2: st.plotly_chart(plotly_shot_chart(gs_2, game_team_names[1] if len(game_team_names) > 1 else 'Opponent', color_made='#42a5f5'), use_container_width=True)
 
 
 # ================================================================
