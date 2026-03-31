@@ -4,10 +4,6 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-from matplotlib.patches import Circle, Rectangle, Arc
 from nba_api.stats.endpoints import (
     teamgamelog, leaguedashplayerstats, shotchartdetail,
     leaguegamefinder, boxscoresummaryv2, boxscoretraditionalv3,
@@ -23,6 +19,7 @@ st.set_page_config(page_title="NBA Scouting Report Pro", layout="wide",
 
 C_A = "#4CAF50"; C_B = "#2196F3"; ACCENT = "#FEC524"
 BG = "#0e1117"; CARD = "#1a1d23"
+MISS_RED = "#FF1744"  # vivid red for missed shots
 
 st.markdown(f"""<style>
 .stApp {{ background-color: {BG}; color: white; }}
@@ -43,6 +40,11 @@ h1,h2,h3 {{ color: #f0f0f0; }}
 }}
 .player-card img {{ border-radius:10px; width:180px; height:auto; }}
 .player-card h3 {{ margin:.5rem 0 0; }}
+.filter-badge {{
+    display:inline-block; background:#1e2530; border:1px solid #333;
+    border-radius:8px; padding:.3rem .7rem; font-size:.8rem; color:#999;
+    margin-bottom:.5rem;
+}}
 </style>""", unsafe_allow_html=True)
 
 PLT = dict(
@@ -138,58 +140,40 @@ def get_head_to_head(team_id, vs_team_id):
 
 @st.cache_data(ttl=600, show_spinner=False)
 def get_game_summary(game_id):
-    """Fetch game summary with V2→V3 fallback. Normalizes column names."""
     time.sleep(0.6)
     result = {'summary': pd.DataFrame(), 'line_score': pd.DataFrame(), 'other_stats': pd.DataFrame()}
-
-    # Try V2 first (works for seasons <= 2024-25)
     try:
         bs = boxscoresummaryv2.BoxScoreSummaryV2(game_id=game_id)
         dfs = bs.get_data_frames()
-        # DF indices: 0=AvailableVideo 1=GameInfo 2=GameSummary
-        #   3=InactivePlayers 4=LastMeeting 5=LineScore 6=Officials 7=OtherStats
-        result['summary'] = dfs[2] if len(dfs) > 2 else pd.DataFrame()
+        result['summary']    = dfs[2] if len(dfs) > 2 else pd.DataFrame()
         result['line_score'] = dfs[5] if len(dfs) > 5 else pd.DataFrame()
-        result['other_stats'] = dfs[7] if len(dfs) > 7 else pd.DataFrame()
+        result['other_stats']= dfs[7] if len(dfs) > 7 else pd.DataFrame()
         if not result['line_score'].empty:
             return result
     except Exception:
         pass
-
-    # Fallback: try V3 (for 2025-26+)
     try:
         from nba_api.stats.endpoints import boxscoresummaryv3
         bs3 = boxscoresummaryv3.BoxScoreSummaryV3(game_id=game_id)
         dfs3 = bs3.get_data_frames()
-        # V3: 0=GameSummary 1=GameInfo 2=ArenaInfo 3=Officials
-        #     4=LineScore 5=InactivePlayers 6=LastFiveMeetings 7=OtherStats
         ls = dfs3[4] if len(dfs3) > 4 else pd.DataFrame()
-        os = dfs3[7] if len(dfs3) > 7 else pd.DataFrame()
-
-        # Normalize V3 LineScore columns to V2 names
+        ost = dfs3[7] if len(dfs3) > 7 else pd.DataFrame()
         if not ls.empty:
-            rename_ls = {
+            ls = ls.rename(columns={
                 'period1Score':'PTS_QTR1','period2Score':'PTS_QTR2',
                 'period3Score':'PTS_QTR3','period4Score':'PTS_QTR4',
                 'score':'PTS','teamTricode':'TEAM_ABBREVIATION',
-            }
-            ls = ls.rename(columns={k:v for k,v in rename_ls.items() if k in ls.columns})
-
-        # Normalize V3 OtherStats columns to V2 names
-        if not os.empty:
-            rename_os = {
+            })
+        if not ost.empty:
+            ost = ost.rename(columns={
                 'teamTricode':'TEAM_ABBREVIATION',
                 'pointsInThePaint':'PTS_PAINT','pointsSecondChance':'PTS_2ND_CHANCE',
                 'pointsFastBreak':'PTS_FB','pointsFromTurnovers':'PTS_OFF_TO',
                 'biggestLead':'LARGEST_LEAD','leadChanges':'LEAD_CHANGES','timesTied':'TIMES_TIED',
-            }
-            os = os.rename(columns={k:v for k,v in rename_os.items() if k in os.columns})
-
-        result['line_score'] = ls
-        result['other_stats'] = os
+            })
+        result['line_score'] = ls; result['other_stats'] = ost
     except Exception:
         pass
-
     return result
 
 
@@ -199,12 +183,26 @@ def get_game_boxscore(game_id):
     try:
         bs = boxscoretraditionalv3.BoxScoreTraditionalV3(game_id=game_id)
         dfs = bs.get_data_frames()
-        return {
-            'players': dfs[0] if len(dfs) > 0 else pd.DataFrame(),
-            'teams': dfs[2] if len(dfs) > 2 else pd.DataFrame(),
-        }
+        return {'players': dfs[0] if len(dfs) > 0 else pd.DataFrame(),
+                'teams':   dfs[2] if len(dfs) > 2 else pd.DataFrame()}
     except Exception:
         return {'players': pd.DataFrame(), 'teams': pd.DataFrame()}
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def get_quarter_scores_batch(game_ids):
+    """Fetch quarter scores for a list of game IDs (max ~10). Returns list of line_score DFs."""
+    rows = []
+    for gid in game_ids[:10]:  # limit to 10 to avoid rate-limit
+        try:
+            sd = get_game_summary(gid)
+            ls = sd.get('line_score', pd.DataFrame())
+            if not ls.empty:
+                ls['GAME_ID'] = gid
+                rows.append(ls)
+        except Exception:
+            pass
+    return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
 
 
 def filter_games(df, span, loc='All'):
@@ -248,43 +246,115 @@ def agg(df):
 
 
 # ================================================================
-# 3. COURT DRAWING
+# 3. PLOTLY COURT + INTERACTIVE SHOT CHART
 # ================================================================
 
-def draw_court(ax, color='#cccccc', lw=1.2):
-    ax.add_patch(Circle((0,0),7.5,lw=lw,edgecolor=color,facecolor='none'))
-    ax.plot([-30,30],[-7.5,-7.5],lw=lw,color=color)
-    ax.add_patch(Rectangle((-80,-47.5),160,190,lw=lw,edgecolor=color,facecolor='none'))
-    ax.add_patch(Rectangle((-60,-47.5),120,190,lw=lw,edgecolor=color,facecolor='none'))
-    ax.add_patch(Arc((0,142.5),120,120,theta1=0,theta2=180,lw=lw,color=color))
-    ax.add_patch(Arc((0,142.5),120,120,theta1=180,theta2=360,lw=lw,color=color,ls='--',alpha=.3))
-    ax.add_patch(Arc((0,0),80,80,theta1=0,theta2=180,lw=lw,color=color))
-    ax.plot([-220,-220],[-47.5,92.5],lw=lw,color=color)
-    ax.plot([220,220],[-47.5,92.5],lw=lw,color=color)
-    ax.add_patch(Arc((0,0),475,475,theta1=22,theta2=158,lw=lw,color=color))
-    ax.add_patch(Arc((0,422.5),120,120,theta1=180,theta2=0,lw=lw,color=color))
-    ax.plot([-250,250],[422.5,422.5],lw=lw,color=color)
-    ax.plot([-250,-250],[-47.5,422.5],lw=lw,color=color)
-    ax.plot([250,250],[-47.5,422.5],lw=lw,color=color)
-    ax.plot([-250,250],[-47.5,-47.5],lw=lw,color=color)
-    ax.set_xlim(-260,260); ax.set_ylim(-60,440); ax.set_aspect('equal'); ax.axis('off')
+def court_shapes(line_color='#555555', lw=1):
+    """Return list of Plotly shapes that draw an NBA half-court."""
+    shapes = []
+    def line(x0,y0,x1,y1):
+        shapes.append(dict(type='line',x0=x0,y0=y0,x1=x1,y1=y1,
+            line=dict(color=line_color,width=lw)))
+    def rect(x0,y0,x1,y1):
+        shapes.append(dict(type='rect',x0=x0,y0=y0,x1=x1,y1=y1,
+            line=dict(color=line_color,width=lw),fillcolor='rgba(0,0,0,0)'))
+    def circ(xc,yc,r,**kw):
+        shapes.append(dict(type='circle',x0=xc-r,y0=yc-r,x1=xc+r,y1=yc+r,
+            line=dict(color=line_color,width=lw,**kw),fillcolor='rgba(0,0,0,0)'))
+
+    # Outer boundary
+    rect(-250,-47.5,250,422.5)
+    # Baseline
+    line(-250,-47.5,250,-47.5)
+    # Paint (outer)
+    rect(-80,-47.5,80,142.5)
+    # Paint (inner)
+    rect(-60,-47.5,60,142.5)
+    # Free-throw circle
+    circ(0,142.5,60)
+    # Hoop
+    circ(0,0,7.5)
+    # Backboard
+    line(-30,-7.5,30,-7.5)
+    # Restricted area arc
+    circ(0,0,40)
+    # 3-point corners
+    line(-220,-47.5,-220,92.5)
+    line(220,-47.5,220,92.5)
+    # 3-point arc (approximated with a large circle clipped by the corners)
+    # We'll use a path instead — approximate with many points
+    return shapes
 
 
-def plot_shot_chart(shots_df, title_text, bg=BG, color_made='#44ff44', color_miss='#fc0303'):
-    fig,ax = plt.subplots(figsize=(6,5.5), facecolor=bg)
-    ax.set_facecolor(bg)
-    draw_court(ax)
+def three_point_arc_trace(line_color='#555555', lw=1):
+    """Return a Scatter trace that draws the 3-point arc."""
+    angles = np.linspace(np.radians(22), np.radians(158), 60)
+    r = 237.5
+    xs = r * np.cos(angles)
+    ys = r * np.sin(angles)
+    return go.Scatter(x=xs, y=ys, mode='lines',
+        line=dict(color=line_color, width=lw),
+        hoverinfo='skip', showlegend=False)
+
+
+def plotly_shot_chart(shots_df, title_text, color_made='#44ff44'):
+    """Create an interactive Plotly shot chart with hover details."""
+    fig = go.Figure()
+
+    # Court lines
+    fig.add_trace(three_point_arc_trace())
+    fig.update_layout(shapes=court_shapes())
+
     if shots_df.empty:
-        ax.text(0,200,"No shot data",ha='center',va='center',fontsize=14,color='#888')
+        fig.add_annotation(x=0, y=200, text="No shot data available",
+            font=dict(size=16, color='#888'), showarrow=False)
     else:
-        missed = shots_df[shots_df['SHOT_MADE_FLAG']==0]
-        made   = shots_df[shots_df['SHOT_MADE_FLAG']==1]
-        ax.scatter(missed['LOC_X'],missed['LOC_Y'],c=color_miss,marker='o',s=10,alpha=.35,linewidths=.6,label='Missed')
-        ax.scatter(made['LOC_X'],made['LOC_Y'],c=color_made,marker='o',s=12,alpha=.45,edgecolors='none',label='Made')
-        total=len(shots_df); mc=len(made); pct=mc/total*100 if total else 0
-        ax.legend(loc='upper right',fontsize=8,framealpha=.3,labelcolor='white',facecolor='#222')
-        ax.set_title(f"{title_text}  —  {mc}/{total} ({pct:.1f}%)",color='white',fontsize=11,fontweight='bold',pad=10)
-    plt.tight_layout(); return fig
+        # Build hover text
+        def hover(row):
+            name = row.get('PLAYER_NAME', '—')
+            action = row.get('ACTION_TYPE', '—')
+            zone = row.get('SHOT_ZONE_BASIC', '—')
+            dist = row.get('SHOT_DISTANCE', '?')
+            result = '✅ Made' if row['SHOT_MADE_FLAG'] == 1 else '❌ Missed'
+            return f"<b>{name}</b><br>{action}<br>{zone} · {dist}ft<br>{result}"
+
+        shots_df = shots_df.copy()
+        shots_df['hover'] = shots_df.apply(hover, axis=1)
+
+        missed = shots_df[shots_df['SHOT_MADE_FLAG'] == 0]
+        made   = shots_df[shots_df['SHOT_MADE_FLAG'] == 1]
+
+        # Missed: circle-open in vivid red, full opacity
+        if not missed.empty:
+            fig.add_trace(go.Scatter(
+                x=missed['LOC_X'], y=missed['LOC_Y'], mode='markers',
+                marker=dict(symbol='circle-open', size=5, color=MISS_RED,
+                            line=dict(width=1.2, color=MISS_RED)),
+                text=missed['hover'], hoverinfo='text',
+                name='Missed', legendgroup='miss'))
+
+        # Made: filled circle in green
+        if not made.empty:
+            fig.add_trace(go.Scatter(
+                x=made['LOC_X'], y=made['LOC_Y'], mode='markers',
+                marker=dict(symbol='circle', size=5, color=color_made, opacity=.7),
+                text=made['hover'], hoverinfo='text',
+                name='Made', legendgroup='made'))
+
+        total = len(shots_df); mc = len(made)
+        pct = mc/total*100 if total else 0
+        title_text = f"{title_text}  —  {mc}/{total} ({pct:.1f}%)"
+
+    fig.update_layout(
+        **PLT, height=520, width=520,
+        title=dict(text=title_text, font_size=13),
+        xaxis=dict(range=[-260,260], showgrid=False, zeroline=False,
+                   showticklabels=False, fixedrange=True),
+        yaxis=dict(range=[-60,440], showgrid=False, zeroline=False,
+                   showticklabels=False, scaleanchor='x', scaleratio=1, fixedrange=True),
+        hovermode='closest',
+    )
+    return fig
 
 
 # ================================================================
@@ -349,12 +419,26 @@ def header():
     st.markdown("---")
 
 
+def filter_badge(applies_season=True, applies_span=True, applies_loc=True):
+    """Show which filters are active on this page."""
+    parts = []
+    if applies_season:  parts.append(f"Season: {sel_season}")
+    else:               parts.append("Season: <i>all-time</i>")
+    if applies_span:    parts.append(f"Span: {game_span}")
+    else:               parts.append("Span: <i>N/A</i>")
+    if applies_loc:     parts.append(f"Location: {loc_filter}")
+    else:               parts.append("Location: <i>N/A</i>")
+    st.markdown(f"<div class='filter-badge'>🔧 {'  ·  '.join(parts)}</div>", unsafe_allow_html=True)
+
+
 # ================================================================
 # PAGE 1 — OVERVIEW
 # ================================================================
 
 def pg_overview():
     header()
+    filter_badge()
+
     cols = st.columns(6)
     for col,(label,k,b) in zip(cols,[
         ("Points",'PTS','h'),("Rebounds",'REB','h'),("Assists",'AST','h'),
@@ -383,6 +467,78 @@ def pg_overview():
         fig.update_layout(**PLT,height=370,showlegend=True)
         st.plotly_chart(fig,use_container_width=True)
 
+    # ---- Quarter Score Analysis (averages) ----
+    st.markdown("### 📊 Average Scoring by Quarter")
+    st.caption("Based on up to 10 most recent games in the current filter.")
+
+    gids_a = df_a['Game_ID'].head(10).tolist() if 'Game_ID' in df_a.columns and not df_a.empty else []
+    gids_b = df_b['Game_ID'].head(10).tolist() if 'Game_ID' in df_b.columns and not df_b.empty else []
+
+    if gids_a or gids_b:
+        with st.spinner("Loading quarter scores…"):
+            all_gids = list(set(gids_a + gids_b))
+            qs_all = get_quarter_scores_batch(tuple(all_gids))
+
+        if not qs_all.empty:
+            qcols = ['PTS_QTR1','PTS_QTR2','PTS_QTR3','PTS_QTR4']
+            for c in qcols:
+                if c in qs_all.columns:
+                    qs_all[c] = pd.to_numeric(qs_all[c], errors='coerce').fillna(0)
+
+            # Identify team rows by TEAM_ID or TEAM_ABBREVIATION
+            id_col = 'TEAM_ID' if 'TEAM_ID' in qs_all.columns else 'teamId'
+            if id_col in qs_all.columns:
+                qs_all[id_col] = pd.to_numeric(qs_all[id_col], errors='coerce')
+                qa = qs_all[qs_all[id_col] == team_a_id]
+                qb = qs_all[qs_all[id_col] == team_b_id]
+            else:
+                abbr_col = 'TEAM_ABBREVIATION'
+                qa = qs_all[qs_all.get(abbr_col,'') == team_a_abbr] if abbr_col in qs_all.columns else pd.DataFrame()
+                qb = qs_all[qs_all.get(abbr_col,'') == team_b_abbr] if abbr_col in qs_all.columns else pd.DataFrame()
+
+            avail_qcols = [c for c in qcols if c in qs_all.columns]
+            q_labels = ['Q1','Q2','Q3','Q4'][:len(avail_qcols)]
+
+            if not qa.empty or not qb.empty:
+                avg_a = [qa[c].mean() if not qa.empty and c in qa.columns else 0 for c in avail_qcols]
+                avg_b = [qb[c].mean() if not qb.empty and c in qb.columns else 0 for c in avail_qcols]
+
+                left, right = st.columns(2)
+                with left:
+                    fig = go.Figure()
+                    fig.add_trace(go.Bar(x=q_labels, y=avg_a, name=team_a_abbr, marker_color=C_A,
+                        text=[f"{v:.1f}" for v in avg_a], textposition='outside'))
+                    fig.add_trace(go.Bar(x=q_labels, y=avg_b, name=team_b_abbr, marker_color=C_B,
+                        text=[f"{v:.1f}" for v in avg_b], textposition='outside'))
+                    fig.update_layout(**PLT, height=340, barmode='group',
+                        title=dict(text='Avg Points per Quarter', font_size=13))
+                    st.plotly_chart(fig, use_container_width=True)
+
+                with right:
+                    # Cumulative score flow (averages)
+                    cum_a = np.cumsum(avg_a)
+                    cum_b = np.cumsum(avg_b)
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(x=q_labels, y=cum_a, mode='lines+markers+text',
+                        name=team_a_abbr, line=dict(color=C_A, width=3), marker=dict(size=10),
+                        text=[f"{v:.1f}" for v in cum_a], textposition='top center'))
+                    fig.add_trace(go.Scatter(x=q_labels, y=cum_b, mode='lines+markers+text',
+                        name=team_b_abbr, line=dict(color=C_B, width=3), marker=dict(size=10),
+                        text=[f"{v:.1f}" for v in cum_b], textposition='bottom center'))
+                    fig.update_layout(**PLT, height=340,
+                        title=dict(text='Avg Cumulative Score Flow', font_size=13))
+                    st.plotly_chart(fig, use_container_width=True)
+
+                # Quarter differential
+                diffs = [avg_a[i] - avg_b[i] for i in range(len(q_labels))]
+                cs = [C_A if d >= 0 else C_B for d in diffs]
+                fig = go.Figure(go.Bar(x=q_labels, y=diffs, marker_color=cs,
+                    text=[f"{d:+.1f}" for d in diffs], textposition='outside'))
+                fig.update_layout(**PLT, height=280,
+                    title=dict(text=f'{team_a_abbr} avg quarter margin vs {team_b_abbr}', font_size=13))
+                st.plotly_chart(fig, use_container_width=True)
+
+    # ---- Home vs Away ----
     st.markdown("### Home vs Away Performance")
     ha=agg(filter_games(log_a,game_span,'Home')); aa=agg(filter_games(log_a,game_span,'Away'))
     hb=agg(filter_games(log_b,game_span,'Home')); ab_=agg(filter_games(log_b,game_span,'Away'))
@@ -404,6 +560,8 @@ def pg_overview():
 
 def pg_advanced():
     header()
+    filter_badge()
+
     cols = st.columns(6)
     for col,(label,k,b,s) in zip(cols,[
         ("Off. Rating",'ORTG','h',''),("True Shooting",'TS%','h','%'),("eFG%",'eFG%','h','%'),
@@ -448,6 +606,9 @@ def pg_advanced():
 
 def pg_players():
     header()
+    filter_badge(applies_span=False, applies_loc=False)
+    st.caption("Player stats are full-season aggregates — Game Span and Location filters do not apply.")
+
     with st.spinner("Loading player stats…"):
         pa=get_players(team_a_id,sel_season); pb=get_players(team_b_id,sel_season)
 
@@ -462,7 +623,6 @@ def pg_players():
             else: st.warning("Data unavailable.")
     if pa.empty or pb.empty: return
 
-    # 3PT Shooters
     st.markdown("### 🎯 Best 3-Point Shooters (min 1 3PA/game)")
     c1,c2=st.columns(2)
     for col,p,abbr,color in [(c1,pa,team_a_abbr,C_A),(c2,pb,team_b_abbr,C_B)]:
@@ -474,7 +634,6 @@ def pg_players():
                 fig.update_layout(**PLT,height=280,title=dict(text=f'{abbr} — 3PT Leaders',font_size=13),xaxis=dict(range=[0,sh['3P%'].max()+15]),yaxis=dict(autorange='reversed'))
                 st.plotly_chart(fig,use_container_width=True)
 
-    # TS% Leaders
     st.markdown("### 🔥 Most Efficient Scorers (True Shooting %)")
     c1,c2=st.columns(2)
     for col,p,abbr,color in [(c1,pa,team_a_abbr,C_A),(c2,pb,team_b_abbr,C_B)]:
@@ -486,7 +645,6 @@ def pg_players():
                 fig.update_layout(**PLT,height=280,title=dict(text=f'{abbr} — TS%',font_size=13),xaxis=dict(range=[0,eff['TS%'].max()+12]),yaxis=dict(autorange='reversed'))
                 st.plotly_chart(fig,use_container_width=True)
 
-    # Rebounders
     st.markdown("### 💪 Top Rebounders")
     c1,c2=st.columns(2)
     for col,p,abbr,color in [(c1,pa,team_a_abbr,C_A),(c2,pb,team_b_abbr,C_B)]:
@@ -499,7 +657,6 @@ def pg_players():
                 fig.update_layout(**PLT,height=280,barmode='stack',title=dict(text=f'{abbr} — Rebounds',font_size=13),yaxis=dict(autorange='reversed'))
                 st.plotly_chart(fig,use_container_width=True)
 
-    # 2P%
     st.markdown("### 🔢 2-Point FG% (min 2 2PA/game)")
     c1,c2=st.columns(2)
     for col,p,abbr,color in [(c1,pa,team_a_abbr,C_A),(c2,pb,team_b_abbr,C_B)]:
@@ -511,9 +668,7 @@ def pg_players():
                 fig.update_layout(**PLT,height=280,title=dict(text=f'{abbr} — 2PT%',font_size=13),xaxis=dict(range=[0,tp['2P%'].max()+15]),yaxis=dict(autorange='reversed'))
                 st.plotly_chart(fig,use_container_width=True)
 
-    # FT Rate
     st.markdown("### 🎪 Free Throw Rate (FTA / FGA)")
-    st.caption("Higher = draws more fouls relative to shot attempts.")
     c1,c2=st.columns(2)
     for col,p,abbr,color in [(c1,pa,team_a_abbr,C_A),(c2,pb,team_b_abbr,C_B)]:
         with col:
@@ -524,7 +679,6 @@ def pg_players():
                 fig.update_layout(**PLT,height=300,title=dict(text=f'{abbr} — FT Rate',font_size=13),xaxis=dict(range=[0,ft['FTr'].max()+.15]),yaxis=dict(autorange='reversed'))
                 st.plotly_chart(fig,use_container_width=True)
 
-    # FT%
     st.markdown("### 🏹 Free Throw Accuracy (min 1 FTA/game)")
     c1,c2=st.columns(2)
     for col,p,abbr,color in [(c1,pa,team_a_abbr,C_A),(c2,pb,team_b_abbr,C_B)]:
@@ -536,7 +690,6 @@ def pg_players():
                 fig.update_layout(**PLT,height=300,title=dict(text=f'{abbr} — FT%',font_size=13),xaxis=dict(range=[0,105]),yaxis=dict(autorange='reversed'))
                 st.plotly_chart(fig,use_container_width=True)
 
-    # Star Radar
     st.markdown("### ⭐ Star Player Comparison")
     star_a=pa.iloc[0]; star_b=pb.iloc[0]
     cats=['Points','Assists','Rebounds','Steals','Blocks']; keys=['PTS','AST','REB','STL','BLK']
@@ -556,13 +709,16 @@ def pg_players():
 
 def pg_shots():
     header()
+    filter_badge(applies_span=False, applies_loc=False)
+    st.caption("Shot chart data covers the full season — Game Span and Location filters do not apply.")
     st.subheader(f"Shot Chart — {sel_season}")
+
     with st.spinner("Loading shot data…"):
         shots_a=get_shot_chart(team_a_id,sel_season); shots_b=get_shot_chart(team_b_id,sel_season)
 
     c1,c2=st.columns(2)
-    with c1: f=plot_shot_chart(shots_a,team_a_name); st.pyplot(f); plt.close(f)
-    with c2: f=plot_shot_chart(shots_b,team_b_name); st.pyplot(f); plt.close(f)
+    with c1: st.plotly_chart(plotly_shot_chart(shots_a,team_a_name,color_made='#66bb6a'),use_container_width=True)
+    with c2: st.plotly_chart(plotly_shot_chart(shots_b,team_b_name,color_made='#42a5f5'),use_container_width=True)
 
     if shots_a.empty and shots_b.empty:
         st.warning("No shot data available."); return
@@ -596,7 +752,6 @@ def pg_shots():
                     fig.update_layout(**PLT,height=380,barmode='stack',yaxis=dict(autorange='reversed'))
                     st.plotly_chart(fig,use_container_width=True)
 
-    # Distance distribution
     st.markdown("### Shot Distance Distribution")
     has_dist = (not shots_a.empty and 'SHOT_DISTANCE' in shots_a.columns) and (not shots_b.empty and 'SHOT_DISTANCE' in shots_b.columns)
     if has_dist:
@@ -626,6 +781,8 @@ def pg_shots():
 
 def pg_analysis():
     header()
+    filter_badge()
+
     st.markdown("### Point Differential per Game")
     for df,abbr,color in [(df_a,team_a_abbr,C_A),(df_b,team_b_abbr,C_B)]:
         if 'PLUS_MINUS' in df.columns and not df.empty:
@@ -673,7 +830,10 @@ def pg_analysis():
 
 def pg_h2h():
     header()
+    filter_badge(applies_season=False, applies_span=False, applies_loc=False)
+    st.caption("Head-to-head data is all-time — season and game filters do not apply.")
     st.subheader(f"⚔️ {team_a_name} vs {team_b_name} — All-Time Regular Season")
+
     with st.spinner("Loading head-to-head…"):
         h2h=get_head_to_head(team_a_id,team_b_id)
     if h2h.empty: st.warning("No data found."); return
@@ -723,336 +883,211 @@ def pg_h2h():
 
 
 # ================================================================
-# PAGE 7 — PLAYER COMPARISON (NEW)
+# PAGE 7 — PLAYER COMPARISON
 # ================================================================
 
 def pg_player_compare():
     header()
+    filter_badge(applies_span=False, applies_loc=False)
+    st.caption("Player stats and shot charts are full-season — Game Span and Location filters do not apply.")
     st.subheader("👤 Player-vs-Player Comparison")
 
     with st.spinner("Loading rosters…"):
         pa = get_players(team_a_id, sel_season)
         pb = get_players(team_b_id, sel_season)
-
     if pa.empty or pb.empty:
-        st.warning("Player data unavailable for one or both teams.")
-        return
+        st.warning("Player data unavailable."); return
 
-    # Player selectors
+    c1, c2 = st.columns(2)
+    with c1: sel_a = st.selectbox(f"Select {team_a_abbr} player", pa['PLAYER_NAME'].tolist(), index=0, key='pa')
+    with c2: sel_b = st.selectbox(f"Select {team_b_abbr} player", pb['PLAYER_NAME'].tolist(), index=0, key='pb')
+
+    p_a = pa[pa['PLAYER_NAME']==sel_a].iloc[0]; p_b = pb[pb['PLAYER_NAME']==sel_b].iloc[0]
+    pid_a = int(p_a['PLAYER_ID']); pid_b = int(p_b['PLAYER_ID'])
+
     c1, c2 = st.columns(2)
     with c1:
-        names_a = pa['PLAYER_NAME'].tolist()
-        sel_a = st.selectbox(f"Select {team_a_abbr} player", names_a, index=0, key='pa')
+        st.markdown(f"<div class='player-card'><img src='{HEADSHOT_URL.format(pid=pid_a)}'"
+            f" onerror=\"this.src='https://cdn.nba.com/headshots/nba/latest/1040x760/fallback.png'\">"
+            f"<h3 style='color:{C_A}'>{sel_a}</h3><div style='color:#999'>{team_a_name}</div></div>", unsafe_allow_html=True)
     with c2:
-        names_b = pb['PLAYER_NAME'].tolist()
-        sel_b = st.selectbox(f"Select {team_b_abbr} player", names_b, index=0, key='pb')
+        st.markdown(f"<div class='player-card'><img src='{HEADSHOT_URL.format(pid=pid_b)}'"
+            f" onerror=\"this.src='https://cdn.nba.com/headshots/nba/latest/1040x760/fallback.png'\">"
+            f"<h3 style='color:{C_B}'>{sel_b}</h3><div style='color:#999'>{team_b_name}</div></div>", unsafe_allow_html=True)
 
-    p_a = pa[pa['PLAYER_NAME'] == sel_a].iloc[0]
-    p_b = pb[pb['PLAYER_NAME'] == sel_b].iloc[0]
-    pid_a = int(p_a['PLAYER_ID'])
-    pid_b = int(p_b['PLAYER_ID'])
-
-    # ---- Player Cards with Photos ----
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown(f"""<div class='player-card'>
-            <img src='{HEADSHOT_URL.format(pid=pid_a)}' onerror="this.src='https://cdn.nba.com/headshots/nba/latest/1040x760/fallback.png'">
-            <h3 style='color:{C_A}'>{sel_a}</h3>
-            <div style='color:#999'>{team_a_name}</div>
-        </div>""", unsafe_allow_html=True)
-    with c2:
-        st.markdown(f"""<div class='player-card'>
-            <img src='{HEADSHOT_URL.format(pid=pid_b)}' onerror="this.src='https://cdn.nba.com/headshots/nba/latest/1040x760/fallback.png'">
-            <h3 style='color:{C_B}'>{sel_b}</h3>
-            <div style='color:#999'>{team_b_name}</div>
-        </div>""", unsafe_allow_html=True)
-
-    st.markdown("")
-
-    # ---- KPI Comparison ----
     st.markdown("### Key Stats Comparison")
-    kpis = [
-        ('GP', 'Games Played', 'h'),
-        ('PTS', 'Points', 'h'),
-        ('AST', 'Assists', 'h'),
-        ('REB', 'Rebounds', 'h'),
-        ('STL', 'Steals', 'h'),
-        ('BLK', 'Blocks', 'h'),
-        ('TOV', 'Turnovers', 'l'),
-        ('FG%', 'FG%', 'h'),
-        ('3P%', '3PT%', 'h'),
-        ('FT%', 'FT%', 'h'),
-        ('2P%', '2PT%', 'h'),
-        ('TS%', 'True Shooting %', 'h'),
-        ('FTr', 'Free Throw Rate', 'h'),
-    ]
-
-    # 4-column layout: name_a | val_a | val_b | name_b
-    rows = st.columns(4)
-    rows[0].markdown(f"**{sel_a}**"); rows[1].markdown("**Stat**")
-    rows[2].markdown("**Stat**"); rows[3].markdown(f"**{sel_b}**")
-
+    kpis = [('GP','Games','h'),('PTS','Points','h'),('AST','Assists','h'),('REB','Rebounds','h'),
+        ('STL','Steals','h'),('BLK','Blocks','h'),('TOV','Turnovers','l'),
+        ('FG%','FG%','h'),('3P%','3PT%','h'),('FT%','FT%','h'),('2P%','2PT%','h'),
+        ('TS%','True Shooting','h'),('FTr','FT Rate','h')]
     for k, label, better in kpis:
-        va = p_a[k] if k in p_a.index else 0
-        vb = p_b[k] if k in p_b.index else 0
-
-        fmt = f"{va:.1f}" if isinstance(va, float) else str(va)
+        va = p_a[k] if k in p_a.index else 0; vb = p_b[k] if k in p_b.index else 0
+        fmt_a = f"{va:.1f}" if isinstance(va, float) else str(va)
         fmt_b = f"{vb:.1f}" if isinstance(vb, float) else str(vb)
+        if better=='h': c_a=C_A if va>vb else '#666'; c_b=C_B if vb>va else '#666'
+        else:           c_a=C_A if va<vb else '#666'; c_b=C_B if vb<va else '#666'
+        c1,c2,c3,c4 = st.columns([2,2,2,2])
+        c1.markdown(f"<span style='color:{c_a};font-size:1.2rem;font-weight:700'>{fmt_a}</span>",unsafe_allow_html=True)
+        c2.markdown(f"<span style='color:#999'>{label}</span>",unsafe_allow_html=True)
+        c3.markdown(f"<span style='color:#999'>{label}</span>",unsafe_allow_html=True)
+        c4.markdown(f"<span style='color:{c_b};font-size:1.2rem;font-weight:700'>{fmt_b}</span>",unsafe_allow_html=True)
 
-        # Color winner
-        if better == 'h':
-            c_a = C_A if va > vb else '#666'
-            c_b = C_B if vb > va else '#666'
-        else:
-            c_a = C_A if va < vb else '#666'
-            c_b = C_B if vb < va else '#666'
-
-        c1, c2, c3, c4 = st.columns([2,2,2,2])
-        c1.markdown(f"<span style='color:{c_a};font-size:1.2rem;font-weight:700'>{fmt}</span>", unsafe_allow_html=True)
-        c2.markdown(f"<span style='color:#999'>{label}</span>", unsafe_allow_html=True)
-        c3.markdown(f"<span style='color:#999'>{label}</span>", unsafe_allow_html=True)
-        c4.markdown(f"<span style='color:{c_b};font-size:1.2rem;font-weight:700'>{fmt_b}</span>", unsafe_allow_html=True)
-
-    # ---- Radar ----
     st.markdown("### Player Radar")
-    cats = ['Points','Assists','Rebounds','Steals','Blocks','TS%']
-    keys = ['PTS','AST','REB','STL','BLK','TS%']
-    maxes = {'PTS':35,'AST':12,'REB':14,'STL':3,'BLK':3.5,'TS%':70}
-    def nr(row):
-        return [min((row[k] if k in row.index else 0)/maxes[k],1) for k in keys]
-    ra = nr(p_a); rb = nr(p_b)
-    fig = go.Figure()
-    fig.add_trace(go.Scatterpolar(r=ra+[ra[0]], theta=cats+[cats[0]], fill='toself',
-        name=sel_a, fillcolor='rgba(76,175,80,.2)', line_color=C_A))
-    fig.add_trace(go.Scatterpolar(r=rb+[rb[0]], theta=cats+[cats[0]], fill='toself',
-        name=sel_b, fillcolor='rgba(33,150,243,.2)', line_color=C_B))
-    fig.update_layout(**PLT, height=420,
-        polar=dict(bgcolor='rgba(0,0,0,0)',
-            radialaxis=dict(visible=True,range=[0,1],showticklabels=False,gridcolor='#333'),
-            angularaxis=dict(gridcolor='#333')))
-    st.plotly_chart(fig, use_container_width=True)
+    cats=['Points','Assists','Rebounds','Steals','Blocks','TS%']
+    keys=['PTS','AST','REB','STL','BLK','TS%']
+    maxes={'PTS':35,'AST':12,'REB':14,'STL':3,'BLK':3.5,'TS%':70}
+    def nr(row): return [min((row[k] if k in row.index else 0)/maxes[k],1) for k in keys]
+    ra=nr(p_a); rb=nr(p_b)
+    fig=go.Figure()
+    fig.add_trace(go.Scatterpolar(r=ra+[ra[0]],theta=cats+[cats[0]],fill='toself',name=sel_a,fillcolor='rgba(76,175,80,.2)',line_color=C_A))
+    fig.add_trace(go.Scatterpolar(r=rb+[rb[0]],theta=cats+[cats[0]],fill='toself',name=sel_b,fillcolor='rgba(33,150,243,.2)',line_color=C_B))
+    fig.update_layout(**PLT,height=420,polar=dict(bgcolor='rgba(0,0,0,0)',radialaxis=dict(visible=True,range=[0,1],showticklabels=False,gridcolor='#333'),angularaxis=dict(gridcolor='#333')))
+    st.plotly_chart(fig,use_container_width=True)
 
-    # ---- Shot Charts ----
     st.markdown("### Shot Placement")
     with st.spinner("Loading individual shot charts…"):
         shots_pa = get_shot_chart(team_a_id, sel_season, player_id=pid_a)
         shots_pb = get_shot_chart(team_b_id, sel_season, player_id=pid_b)
-
     c1, c2 = st.columns(2)
-    with c1:
-        f = plot_shot_chart(shots_pa, sel_a, color_made='#66bb6a', color_miss='#fc0303')
-        st.pyplot(f); plt.close(f)
-    with c2:
-        f = plot_shot_chart(shots_pb, sel_b, color_made='#42a5f5', color_miss='#fc0303')
-        st.pyplot(f); plt.close(f)
+    with c1: st.plotly_chart(plotly_shot_chart(shots_pa,sel_a,color_made='#66bb6a'),use_container_width=True)
+    with c2: st.plotly_chart(plotly_shot_chart(shots_pb,sel_b,color_made='#42a5f5'),use_container_width=True)
 
-    # Zone comparison
     if not shots_pa.empty and not shots_pb.empty and 'SHOT_ZONE_BASIC' in shots_pa.columns:
         st.markdown("### Shot Zone Comparison")
-        c1, c2 = st.columns(2)
-        for col, shots, name, color in [(c1,shots_pa,sel_a,C_A),(c2,shots_pb,sel_b,C_B)]:
+        c1,c2=st.columns(2)
+        for col,shots,name,color in [(c1,shots_pa,sel_a,C_A),(c2,shots_pb,sel_b,C_B)]:
             with col:
-                zs = shots.groupby('SHOT_ZONE_BASIC').agg(
-                    Att=('SHOT_MADE_FLAG','count'), Made=('SHOT_MADE_FLAG','sum')).reset_index()
-                zs['Pct'] = (zs['Made']/zs['Att']*100).round(1)
-                zs = zs.sort_values('Att', ascending=True)
-                fig = go.Figure()
-                fig.add_trace(go.Bar(y=zs['SHOT_ZONE_BASIC'],x=zs['Att'],orientation='h',
-                    name='Attempts',marker_color=color,opacity=.35))
-                fig.add_trace(go.Bar(y=zs['SHOT_ZONE_BASIC'],x=zs['Made'],orientation='h',
-                    name='Makes',marker_color=color,
+                zs=shots.groupby('SHOT_ZONE_BASIC').agg(Att=('SHOT_MADE_FLAG','count'),Made=('SHOT_MADE_FLAG','sum')).reset_index()
+                zs['Pct']=(zs['Made']/zs['Att']*100).round(1); zs=zs.sort_values('Att',ascending=True)
+                fig=go.Figure()
+                fig.add_trace(go.Bar(y=zs['SHOT_ZONE_BASIC'],x=zs['Att'],orientation='h',name='Att.',marker_color=color,opacity=.35))
+                fig.add_trace(go.Bar(y=zs['SHOT_ZONE_BASIC'],x=zs['Made'],orientation='h',name='Made',marker_color=color,
                     text=zs.apply(lambda r:f"{r['Made']} ({r['Pct']}%)",axis=1),textposition='inside'))
                 fig.update_layout(**PLT,height=320,barmode='overlay',title=dict(text=name,font_size=13))
                 st.plotly_chart(fig,use_container_width=True)
 
 
 # ================================================================
-# PAGE 8 — SINGLE GAME BREAKDOWN (NEW)
+# PAGE 8 — SINGLE GAME BREAKDOWN
 # ================================================================
 
 def pg_single_game():
     header()
+    filter_badge()
     st.subheader("🏟️ Single Game Breakdown")
+    st.caption("Games listed below respect the current Season, Game Span, and Location filters.")
 
-    # Build list of recent games from both teams
     game_list = []
     for df, abbr in [(df_a, team_a_abbr), (df_b, team_b_abbr)]:
         if not df.empty and 'Game_ID' in df.columns:
             for _, row in df.head(15).iterrows():
                 gid = row['Game_ID']
                 date = row['GAME_DATE'].strftime('%Y-%m-%d')
-                matchup = row.get('MATCHUP', '')
-                wl = row.get('WL', '')
-                pts = row.get('PTS', 0)
-                label = f"{date} | {matchup} | {wl} {pts:.0f}pts"
-                game_list.append({'label': label, 'game_id': gid, 'date': date, 'team': abbr})
-
+                matchup = row.get('MATCHUP',''); wl = row.get('WL',''); pts = row.get('PTS',0)
+                game_list.append({'label':f"{date} | {matchup} | {wl} {pts:.0f}pts",'game_id':gid})
     if not game_list:
-        st.warning("No games available. The Game_ID column may be missing.")
-        return
+        st.warning("No games available."); return
 
-    # Dropdown to select a game
-    labels = [g['label'] for g in game_list]
-    # Remove duplicates while preserving order
-    seen = set()
-    unique_games = []
+    seen=set(); unique=[]
     for g in game_list:
-        if g['game_id'] not in seen:
-            seen.add(g['game_id'])
-            unique_games.append(g)
-    unique_labels = [g['label'] for g in unique_games]
+        if g['game_id'] not in seen: seen.add(g['game_id']); unique.append(g)
 
-    selected_label = st.selectbox("Select a game to analyze", unique_labels, index=0)
-    sel_game = next(g for g in unique_games if g['label'] == selected_label)
-    game_id = sel_game['game_id']
-
+    selected_label = st.selectbox("Select a game", [g['label'] for g in unique], index=0)
+    game_id = next(g['game_id'] for g in unique if g['label']==selected_label)
     st.info(f"📋 Game ID: {game_id}")
 
-    # ---- Load game data ----
     with st.spinner("Loading game details…"):
         summary_data = get_game_summary(game_id)
         boxscore_data = get_game_boxscore(game_id)
 
-    line_score = summary_data.get('line_score', pd.DataFrame())
-    other_stats = summary_data.get('other_stats', pd.DataFrame())
-    players_bs = boxscore_data.get('players', pd.DataFrame())
-    teams_bs = boxscore_data.get('teams', pd.DataFrame())
+    line_score = summary_data.get('line_score',pd.DataFrame())
+    other_stats = summary_data.get('other_stats',pd.DataFrame())
+    players_bs = boxscore_data.get('players',pd.DataFrame())
 
-    # ---- Quarter-by-Quarter Scores ----
+    # Quarter scores
     if not line_score.empty:
         st.markdown("### 📊 Quarter-by-Quarter Scores")
-
-        qcols = ['PTS_QTR1','PTS_QTR2','PTS_QTR3','PTS_QTR4']
-        ot_cols = [c for c in line_score.columns if c.startswith('PTS_OT') and line_score[c].sum() > 0]
-        all_q = qcols + ot_cols
-        q_labels = ['Q1','Q2','Q3','Q4'] + [c.replace('PTS_','') for c in ot_cols]
-
-        # Ensure numeric
+        qcols=['PTS_QTR1','PTS_QTR2','PTS_QTR3','PTS_QTR4']
+        ot_cols=[c for c in line_score.columns if c.startswith('PTS_OT') and pd.to_numeric(line_score[c],errors='coerce').sum()>0]
+        all_q=qcols+ot_cols; q_labels=['Q1','Q2','Q3','Q4']+[c.replace('PTS_','') for c in ot_cols]
         for c in all_q:
-            if c in line_score.columns:
-                line_score[c] = pd.to_numeric(line_score[c], errors='coerce').fillna(0)
-        if 'PTS' in line_score.columns:
-            line_score['PTS'] = pd.to_numeric(line_score['PTS'], errors='coerce').fillna(0)
+            if c in line_score.columns: line_score[c]=pd.to_numeric(line_score[c],errors='coerce').fillna(0)
+        if 'PTS' in line_score.columns: line_score['PTS']=pd.to_numeric(line_score['PTS'],errors='coerce').fillna(0)
 
-        if len(line_score) >= 2:
-            t1 = line_score.iloc[0]
-            t2 = line_score.iloc[1]
-            t1_name = t1.get('TEAM_ABBREVIATION', 'Team 1')
-            t2_name = t2.get('TEAM_ABBREVIATION', 'Team 2')
+        if len(line_score)>=2:
+            t1=line_score.iloc[0]; t2=line_score.iloc[1]
+            t1n=t1.get('TEAM_ABBREVIATION','Team 1'); t2n=t2.get('TEAM_ABBREVIATION','Team 2')
+            score_data={'Quarter':q_labels+['TOTAL']}
+            score_data[t1n]=[int(t1.get(c,0)) for c in all_q]+[int(t1.get('PTS',0))]
+            score_data[t2n]=[int(t2.get(c,0)) for c in all_q]+[int(t2.get('PTS',0))]
+            st.dataframe(pd.DataFrame(score_data),use_container_width=True,hide_index=True)
 
-            # Score table
-            score_data = {'Quarter': q_labels + ['TOTAL']}
-            score_data[t1_name] = [int(t1.get(c, 0)) for c in all_q] + [int(t1.get('PTS', 0))]
-            score_data[t2_name] = [int(t2.get(c, 0)) for c in all_q] + [int(t2.get('PTS', 0))]
-            st.dataframe(pd.DataFrame(score_data), use_container_width=True, hide_index=True)
+            t1v=[float(t1.get(c,0)) for c in all_q]; t2v=[float(t2.get(c,0)) for c in all_q]
+            fig=go.Figure()
+            fig.add_trace(go.Bar(x=q_labels,y=t1v,name=t1n,marker_color=C_A,text=[f"{v:.0f}" for v in t1v],textposition='outside'))
+            fig.add_trace(go.Bar(x=q_labels,y=t2v,name=t2n,marker_color=C_B,text=[f"{v:.0f}" for v in t2v],textposition='outside'))
+            fig.update_layout(**PLT,height=350,barmode='group',title=dict(text='Points by Quarter',font_size=14))
+            st.plotly_chart(fig,use_container_width=True)
 
-            # Quarter bar chart
-            t1_vals = [float(t1.get(c, 0)) for c in all_q]
-            t2_vals = [float(t2.get(c, 0)) for c in all_q]
-
-            fig = go.Figure()
-            fig.add_trace(go.Bar(x=q_labels, y=t1_vals, name=t1_name, marker_color=C_A,
-                text=[f"{v:.0f}" for v in t1_vals], textposition='outside'))
-            fig.add_trace(go.Bar(x=q_labels, y=t2_vals, name=t2_name, marker_color=C_B,
-                text=[f"{v:.0f}" for v in t2_vals], textposition='outside'))
-            fig.update_layout(**PLT, height=350, barmode='group',
-                title=dict(text='Points by Quarter', font_size=14))
-            st.plotly_chart(fig, use_container_width=True)
-
-            # Cumulative score flow
             st.markdown("### 📈 Score Flow")
-            cum1 = np.cumsum(t1_vals)
-            cum2 = np.cumsum(t2_vals)
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=q_labels, y=cum1, mode='lines+markers+text',
-                name=t1_name, line=dict(color=C_A, width=3), marker=dict(size=10),
-                text=[f"{v:.0f}" for v in cum1], textposition='top center'))
-            fig.add_trace(go.Scatter(x=q_labels, y=cum2, mode='lines+markers+text',
-                name=t2_name, line=dict(color=C_B, width=3), marker=dict(size=10),
-                text=[f"{v:.0f}" for v in cum2], textposition='bottom center'))
-            fig.update_layout(**PLT, height=350, title=dict(text='Cumulative Score', font_size=14))
-            st.plotly_chart(fig, use_container_width=True)
+            cum1=np.cumsum(t1v); cum2=np.cumsum(t2v)
+            fig=go.Figure()
+            fig.add_trace(go.Scatter(x=q_labels,y=cum1,mode='lines+markers+text',name=t1n,line=dict(color=C_A,width=3),marker=dict(size=10),text=[f"{v:.0f}" for v in cum1],textposition='top center'))
+            fig.add_trace(go.Scatter(x=q_labels,y=cum2,mode='lines+markers+text',name=t2n,line=dict(color=C_B,width=3),marker=dict(size=10),text=[f"{v:.0f}" for v in cum2],textposition='bottom center'))
+            fig.update_layout(**PLT,height=350,title=dict(text='Cumulative Score',font_size=14))
+            st.plotly_chart(fig,use_container_width=True)
 
-            # Quarter differential
-            st.markdown("### Quarter Differential")
-            diffs = [t1_vals[i] - t2_vals[i] for i in range(len(q_labels))]
-            cs = [C_A if d >= 0 else C_B for d in diffs]
-            fig = go.Figure(go.Bar(x=q_labels, y=diffs, marker_color=cs,
-                text=[f"{d:+.0f}" for d in diffs], textposition='outside'))
-            fig.update_layout(**PLT, height=300,
-                title=dict(text=f'{t1_name} margin by quarter', font_size=14),
-                yaxis_title='Point Differential')
-            st.plotly_chart(fig, use_container_width=True)
+            diffs=[t1v[i]-t2v[i] for i in range(len(q_labels))]
+            cs=[C_A if d>=0 else C_B for d in diffs]
+            fig=go.Figure(go.Bar(x=q_labels,y=diffs,marker_color=cs,text=[f"{d:+.0f}" for d in diffs],textposition='outside'))
+            fig.update_layout(**PLT,height=280,title=dict(text=f'{t1n} margin by quarter',font_size=14))
+            st.plotly_chart(fig,use_container_width=True)
 
-    # ---- Other Stats (paint, fastbreak, etc.) ----
-    if not other_stats.empty and len(other_stats) >= 2:
+    # Other stats
+    if not other_stats.empty and len(other_stats)>=2:
         st.markdown("### 🎨 Game Flow Stats")
-        o1 = other_stats.iloc[0]; o2 = other_stats.iloc[1]
-        o1n = o1.get('TEAM_ABBREVIATION','Team 1'); o2n = o2.get('TEAM_ABBREVIATION','Team 2')
-        flow_stats = [
-            ('PTS_PAINT','Points in Paint'),('PTS_2ND_CHANCE','2nd Chance Pts'),
+        o1=other_stats.iloc[0]; o2=other_stats.iloc[1]
+        o1n=o1.get('TEAM_ABBREVIATION','Team 1'); o2n=o2.get('TEAM_ABBREVIATION','Team 2')
+        flow=[('PTS_PAINT','Points in Paint'),('PTS_2ND_CHANCE','2nd Chance Pts'),
             ('PTS_FB','Fast Break Pts'),('PTS_OFF_TO','Pts off Turnovers'),
-            ('LARGEST_LEAD','Largest Lead'),('LEAD_CHANGES','Lead Changes'),
-            ('TIMES_TIED','Times Tied'),
-        ]
-        available = [(k,l) for k,l in flow_stats if k in o1.index]
-        if available:
-            labels_f = [l for _,l in available]
-            v1 = [float(o1.get(k,0)) for k,_ in available]
-            v2 = [float(o2.get(k,0)) for k,_ in available]
-            fig = go.Figure()
-            fig.add_trace(go.Bar(y=labels_f, x=v1, orientation='h', name=o1n, marker_color=C_A,
-                text=[f"{v:.0f}" for v in v1], textposition='auto'))
-            fig.add_trace(go.Bar(y=labels_f, x=v2, orientation='h', name=o2n, marker_color=C_B,
-                text=[f"{v:.0f}" for v in v2], textposition='auto'))
-            fig.update_layout(**PLT, height=380, barmode='group',
-                title=dict(text='Game Flow Stats', font_size=14))
-            st.plotly_chart(fig, use_container_width=True)
+            ('LARGEST_LEAD','Largest Lead'),('LEAD_CHANGES','Lead Changes'),('TIMES_TIED','Times Tied')]
+        avail=[(k,l) for k,l in flow if k in o1.index]
+        if avail:
+            labs_f=[l for _,l in avail]
+            v1=[float(o1.get(k,0)) for k,_ in avail]; v2=[float(o2.get(k,0)) for k,_ in avail]
+            fig=go.Figure()
+            fig.add_trace(go.Bar(y=labs_f,x=v1,orientation='h',name=o1n,marker_color=C_A,text=[f"{v:.0f}" for v in v1],textposition='auto'))
+            fig.add_trace(go.Bar(y=labs_f,x=v2,orientation='h',name=o2n,marker_color=C_B,text=[f"{v:.0f}" for v in v2],textposition='auto'))
+            fig.update_layout(**PLT,height=380,barmode='group',title=dict(text='Game Flow Stats',font_size=14))
+            st.plotly_chart(fig,use_container_width=True)
 
-    # ---- Player Box Score ----
+    # Box score
     if not players_bs.empty:
         st.markdown("### 📋 Player Box Score")
-
-        # Map column names (V3 uses camelCase)
-        col_map = {
-            'firstName':'First','familyName':'Last','teamTricode':'Team',
+        col_map={'firstName':'First','familyName':'Last','teamTricode':'Team',
             'minutes':'MIN','points':'PTS','assists':'AST','reboundsTotal':'REB',
             'reboundsOffensive':'OREB','reboundsDefensive':'DREB',
             'steals':'STL','blocks':'BLK','turnovers':'TOV',
             'fieldGoalsMade':'FGM','fieldGoalsAttempted':'FGA',
             'threePointersMade':'3PM','threePointersAttempted':'3PA',
-            'freeThrowsMade':'FTM','freeThrowsAttempted':'FTA',
-            'plusMinusPoints':'±',
-        }
-        display_bs = players_bs.copy()
-        # Rename available columns
-        rename_dict = {k: v for k, v in col_map.items() if k in display_bs.columns}
-        display_bs = display_bs.rename(columns=rename_dict)
+            'freeThrowsMade':'FTM','freeThrowsAttempted':'FTA','plusMinusPoints':'±'}
+        dbs=players_bs.rename(columns={k:v for k,v in col_map.items() if k in players_bs.columns})
+        show=['First','Last','Team','MIN','PTS','AST','REB','OREB','DREB','STL','BLK','TOV','FGM','FGA','3PM','3PA','FTM','FTA','±']
+        show=[c for c in show if c in dbs.columns]
+        if show: st.dataframe(dbs[show],use_container_width=True,hide_index=True,height=500)
 
-        show_cols = ['First','Last','Team','MIN','PTS','AST','REB','OREB','DREB',
-                     'STL','BLK','TOV','FGM','FGA','3PM','3PA','FTM','FTA','±']
-        show_cols = [c for c in show_cols if c in display_bs.columns]
-
-        if show_cols:
-            st.dataframe(display_bs[show_cols], use_container_width=True, hide_index=True, height=500)
-
-    # ---- Shot chart for this specific game ----
+    # Shot chart for game
     st.markdown("### 🎯 Shot Chart for This Game")
     with st.spinner("Loading game shot chart…"):
-        game_shots_a = get_shot_chart(team_a_id, sel_season, game_id=game_id)
-        game_shots_b = get_shot_chart(team_b_id, sel_season, game_id=game_id)
-
-    c1, c2 = st.columns(2)
-    with c1:
-        f = plot_shot_chart(game_shots_a, team_a_name, color_made='#66bb6a')
-        st.pyplot(f); plt.close(f)
-    with c2:
-        f = plot_shot_chart(game_shots_b, team_b_name, color_made='#42a5f5')
-        st.pyplot(f); plt.close(f)
+        gs_a=get_shot_chart(team_a_id,sel_season,game_id=game_id)
+        gs_b=get_shot_chart(team_b_id,sel_season,game_id=game_id)
+    c1,c2=st.columns(2)
+    with c1: st.plotly_chart(plotly_shot_chart(gs_a,team_a_name,color_made='#66bb6a'),use_container_width=True)
+    with c2: st.plotly_chart(plotly_shot_chart(gs_b,team_b_name,color_made='#42a5f5'),use_container_width=True)
 
 
 # ================================================================
-# 7. PAGE ROUTING
+# 9. PAGE ROUTING
 # ================================================================
 
 routes = {
